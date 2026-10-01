@@ -30,3 +30,17 @@ VITE_DETECTION_API_URL=https://8000-01m3rpwws2erxk10ype6j42344.cloudspaces.litng
 - **Live Camera** — stream the device camera and run continuous detection with a single in-flight `/detect` request at a time
 
 Live camera requires HTTPS outside localhost and browser camera permission.
+
+### Developer diagnostics
+
+Open with `?debug=true` to enable:
+
+- Live Diagnostics panel (latency breakdown, payload size, in-flight count)
+- Capture width / JPEG quality controls
+- Capture-width benchmark
+- Test session recording + quality markers + JSON/CSV export
+
+See `docs/live-camera-evaluation.md`.
+
+**Note:** Capture width is the JPEG uploaded by the browser. Deployed YOLO `imgsz` remains **1280** unless the backend is extended.
+

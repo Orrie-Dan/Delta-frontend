@@ -1,42 +1,82 @@
-const JPEG_QUALITY = 0.8
+import type { FrameCaptureMetrics } from './liveTypes'
+
+function targetSize(
+  sourceWidth: number,
+  sourceHeight: number,
+  captureWidth: number,
+): { width: number; height: number } {
+  if (sourceWidth <= captureWidth) {
+    return { width: sourceWidth, height: sourceHeight }
+  }
+  const scale = captureWidth / sourceWidth
+  return {
+    width: captureWidth,
+    height: Math.max(1, Math.round(sourceHeight * scale)),
+  }
+}
 
 /**
- * Capture the newest available video frame as a JPEG Blob.
- * Reuses a single canvas to avoid allocating per frame.
+ * Draw the newest video frame into an offscreen canvas, optionally downscaled
+ * to `captureWidth` while preserving aspect ratio (no crop / no stretch).
+ * Encodes as JPEG Blob (never base64).
  */
-export function captureVideoFrame(
+export async function captureVideoFrame(
   video: HTMLVideoElement,
   canvas: HTMLCanvasElement,
-  quality = JPEG_QUALITY,
-): Promise<Blob> {
-  const width = video.videoWidth
-  const height = video.videoHeight
+  options: {
+    captureWidth: number
+    jpegQuality: number
+  },
+): Promise<FrameCaptureMetrics> {
+  const sourceWidth = video.videoWidth
+  const sourceHeight = video.videoHeight
 
-  if (!width || !height) {
-    return Promise.reject(new Error('Camera frame is not ready yet.'))
+  if (!sourceWidth || !sourceHeight) {
+    throw new Error('Camera frame is not ready yet.')
   }
 
-  if (canvas.width !== width) canvas.width = width
-  if (canvas.height !== height) canvas.height = height
+  const { width: captureWidth, height: captureHeight } = targetSize(
+    sourceWidth,
+    sourceHeight,
+    options.captureWidth,
+  )
+
+  if (canvas.width !== captureWidth) canvas.width = captureWidth
+  if (canvas.height !== captureHeight) canvas.height = captureHeight
 
   const context = canvas.getContext('2d', { alpha: false })
   if (!context) {
-    return Promise.reject(new Error('Unable to capture camera frame.'))
+    throw new Error('Unable to capture camera frame.')
   }
 
-  context.drawImage(video, 0, 0, width, height)
+  const captureStarted = performance.now()
+  context.drawImage(video, 0, 0, captureWidth, captureHeight)
+  const captureMs = performance.now() - captureStarted
 
-  return new Promise((resolve, reject) => {
+  const encodeStarted = performance.now()
+  const blob = await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob(
-      (blob) => {
-        if (!blob) {
+      (result) => {
+        if (!result) {
           reject(new Error('Failed to encode camera frame as JPEG.'))
           return
         }
-        resolve(blob)
+        resolve(result)
       },
       'image/jpeg',
-      quality,
+      options.jpegQuality,
     )
   })
+  const encodeMs = performance.now() - encodeStarted
+
+  return {
+    blob,
+    sourceWidth,
+    sourceHeight,
+    captureWidth,
+    captureHeight,
+    captureMs,
+    encodeMs,
+    payloadBytes: blob.size,
+  }
 }

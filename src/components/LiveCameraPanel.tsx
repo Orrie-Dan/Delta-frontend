@@ -1,7 +1,21 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { useDebugMode } from '../hooks/useDebugMode'
 import { useLiveDetection } from '../hooks/useLiveDetection'
+import {
+  DEFAULT_LIVE_CAPTURE_WIDTH,
+  DEFAULT_LIVE_JPEG_QUALITY,
+  LIVE_CAPTURE_WIDTHS,
+  LIVE_JPEG_QUALITIES,
+  type LiveCaptureWidth,
+  type LiveJpegQuality,
+  type TestScenario,
+} from '../lib/liveConfig'
+import { getObjectFitContainRect } from '../lib/overlayLayout'
 import type { ApiStatus, Detection } from '../types/detection'
 import { ConfidenceFilter } from './ConfidenceFilter'
+import { LiveBenchmark } from './LiveBenchmark'
+import { LiveDiagnostics } from './LiveDiagnostics'
+import { LiveTestSession } from './LiveTestSession'
 
 interface LiveCameraPanelProps {
   apiStatus: ApiStatus
@@ -10,7 +24,7 @@ interface LiveCameraPanelProps {
   active: boolean
 }
 
-function formatInference(ms: number | null): string {
+function formatMs(ms: number | null): string {
   if (ms === null) return '—'
   return `${(ms / 1000).toFixed(1)}s`
 }
@@ -26,6 +40,33 @@ export function LiveCameraPanel({
   onConfidenceChange,
   active,
 }: LiveCameraPanelProps) {
+  const debug = useDebugMode()
+  const [captureWidth, setCaptureWidth] = useState<LiveCaptureWidth>(
+    DEFAULT_LIVE_CAPTURE_WIDTH,
+  )
+  const [jpegQuality, setJpegQuality] = useState<LiveJpegQuality>(
+    DEFAULT_LIVE_JPEG_QUALITY,
+  )
+  const [scenario, setScenario] = useState<TestScenario>('single_near')
+  const [recording, setRecording] = useState(false)
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(true)
+  const [overlayRect, setOverlayRect] = useState({
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+  })
+  const [videoIntrinsic, setVideoIntrinsic] = useState({ w: 0, h: 0 })
+
+  const live = useLiveDetection({
+    enabled: active,
+    captureWidth,
+    jpegQuality,
+    confidenceThreshold,
+    scenario,
+    recording,
+  })
+
   const {
     videoRef,
     cameraState,
@@ -33,13 +74,23 @@ export function LiveCameraPanel({
     result,
     errorMessage,
     liveStats,
+    diagnostics,
     videoDevices,
     startCamera,
     stopCamera,
     switchCamera,
-  } = useLiveDetection({
-    enabled: active,
-  })
+    addQualityMarker,
+    clearSessionData,
+    exportSession,
+    runCaptureWidthBenchmark,
+    benchmarkRunning,
+    benchmarkProgress,
+    benchmarkSummaries,
+    benchmarkSamples,
+    sessionRecords,
+    sessionMarkers,
+    activeRequests,
+  } = live
 
   const filteredDetections = useMemo(() => {
     if (!result) return [] as Detection[]
@@ -48,7 +99,7 @@ export function LiveCameraPanel({
 
   const filteredPeople = filteredDetections.length
   const isLive = cameraState === 'active'
-  const showOverlay = Boolean(result && isLive)
+  const showOverlay = Boolean(result && isLive && overlayRect.width > 0)
   const canSwitchCamera = videoDevices.length > 1 && isLive
 
   const statusHeadline =
@@ -66,6 +117,41 @@ export function LiveCameraPanel({
                 ? 'Camera active'
                 : 'Camera off'
 
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !isLive) return
+
+    const updateLayout = () => {
+      const w = video.videoWidth
+      const h = video.videoHeight
+      if (w && h) setVideoIntrinsic({ w, h })
+      const rect = getObjectFitContainRect(
+        w || 1,
+        h || 1,
+        video.clientWidth,
+        video.clientHeight,
+      )
+      setOverlayRect(rect)
+    }
+
+    updateLayout()
+    video.addEventListener('loadedmetadata', updateLayout)
+    const observer = new ResizeObserver(updateLayout)
+    observer.observe(video)
+    window.addEventListener('orientationchange', updateLayout)
+
+    return () => {
+      video.removeEventListener('loadedmetadata', updateLayout)
+      observer.disconnect()
+      window.removeEventListener('orientationchange', updateLayout)
+    }
+  }, [isLive, videoRef, result])
+
+  const frameAspectStyle =
+    videoIntrinsic.w > 0 && videoIntrinsic.h > 0
+      ? { aspectRatio: `${videoIntrinsic.w} / ${videoIntrinsic.h}` }
+      : undefined
+
   return (
     <section className="panel panel--live" aria-label="Live camera detection">
       <div className="live-toolbar">
@@ -76,8 +162,50 @@ export function LiveCameraPanel({
         />
       </div>
 
+      {debug && (
+        <div className="live-debug-controls">
+          <label className="live-field">
+            <span>Capture width (network frame)</span>
+            <select
+              value={captureWidth}
+              onChange={(event) =>
+                setCaptureWidth(Number(event.target.value) as LiveCaptureWidth)
+              }
+            >
+              {LIVE_CAPTURE_WIDTHS.map((width) => (
+                <option key={width} value={width}>
+                  {width}px
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="live-field">
+            <span>JPEG quality</span>
+            <select
+              value={jpegQuality}
+              onChange={(event) =>
+                setJpegQuality(Number(event.target.value) as LiveJpegQuality)
+              }
+            >
+              {LIVE_JPEG_QUALITIES.map((quality) => (
+                <option key={quality} value={quality}>
+                  {quality.toFixed(2)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className="live-debug__hint">
+            Capture width ≠ YOLO imgsz. Deployed model imgsz remains 1280.
+            In flight: {activeRequests}
+          </p>
+        </div>
+      )}
+
       <div className="live-viewer">
-        <div className={`live-viewer__frame${isLive ? '' : ' live-viewer__frame--idle'}`}>
+        <div
+          className={`live-viewer__frame${isLive ? '' : ' live-viewer__frame--idle'}`}
+          style={isLive ? frameAspectStyle : undefined}
+        >
           <video
             ref={videoRef}
             className="live-viewer__video"
@@ -93,6 +221,12 @@ export function LiveCameraPanel({
               viewBox={`0 0 ${result.image.width} ${result.image.height}`}
               preserveAspectRatio="none"
               aria-hidden="true"
+              style={{
+                left: overlayRect.x,
+                top: overlayRect.y,
+                width: overlayRect.width,
+                height: overlayRect.height,
+              }}
             >
               {filteredDetections.map((detection, index) => {
                 const width = Math.max(detection.x2 - detection.x1, 1)
@@ -129,9 +263,17 @@ export function LiveCameraPanel({
               </span>
             </div>
             <div className="live-hud__bottom">
-              <span>Inference {formatInference(liveStats.inferenceMs)}</span>
+              <span>
+                Detection {formatMs(liveStats.requestTotalMs ?? liveStats.inferenceMs)}
+              </span>
               <span aria-hidden="true">•</span>
-              <span>Detection {formatFps(liveStats.detectionFps)} fps</span>
+              <span>{formatFps(liveStats.detectionFps)} detection FPS</span>
+              {debug && (
+                <>
+                  <span aria-hidden="true">•</span>
+                  <span>~{formatFps(liveStats.cameraFps)} camera FPS</span>
+                </>
+              )}
             </div>
           </div>
 
@@ -191,6 +333,46 @@ export function LiveCameraPanel({
         <p className="live-help">
           Tip: use HTTPS (or localhost) and allow camera access when prompted.
         </p>
+      )}
+
+      {debug && (
+        <div className="live-debug-stack">
+          <LiveDiagnostics
+            diagnostics={diagnostics}
+            open={diagnosticsOpen}
+            onToggle={() => setDiagnosticsOpen((open) => !open)}
+          />
+
+          <LiveTestSession
+            scenario={scenario}
+            onScenarioChange={setScenario}
+            recording={recording}
+            onStart={() => {
+              clearSessionData()
+              setRecording(true)
+            }}
+            onStop={() => setRecording(false)}
+            recordCount={sessionRecords.length}
+            markerCount={sessionMarkers.length}
+            markers={sessionMarkers}
+            onMarker={addQualityMarker}
+            onExport={exportSession}
+            onClear={() => {
+              setRecording(false)
+              clearSessionData()
+            }}
+            cameraActive={isLive}
+          />
+
+          <LiveBenchmark
+            running={benchmarkRunning}
+            progress={benchmarkProgress}
+            summaries={benchmarkSummaries}
+            samples={benchmarkSamples}
+            cameraActive={isLive}
+            onRun={() => void runCaptureWidthBenchmark()}
+          />
+        </div>
       )}
     </section>
   )

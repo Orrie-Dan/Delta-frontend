@@ -16,6 +16,8 @@ export interface DetectionResponse {
   inference_ms: number
   image: DetectionImage
   detections: Detection[]
+  /** Present only if backend supports configurable imgsz. */
+  model_imgsz?: number
 }
 
 export interface HealthResponse {
@@ -40,5 +42,7 @@ export type CameraLifecycle =
 export interface LiveDetectionStats {
   people: number
   inferenceMs: number | null
+  requestTotalMs: number | null
   detectionFps: number | null
+  cameraFps: number | null
 }

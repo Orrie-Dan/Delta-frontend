@@ -1,4 +1,5 @@
 import type { DetectionResponse, HealthResponse } from '../types/detection'
+import type { RequestTimingMetrics } from '../lib/liveTypes'
 
 const DEFAULT_API_URL =
   'https://8000-01m3rpwws2erxk10ype6j42344.cloudspaces.litng.ai'
@@ -110,16 +111,45 @@ function isValidDetectionResponse(data: unknown): data is DetectionResponse {
   })
 }
 
+export interface DetectPeopleOptions {
+  filename?: string
+  signal?: AbortSignal
+  /** Only sent when backend supports it. Currently deployed API does not. */
+  modelImgsz?: number
+}
+
+export interface DetectPeopleResult {
+  response: DetectionResponse
+  timing: RequestTimingMetrics
+}
+
+function buildDetectUrl(modelImgsz?: number): string {
+  if (!modelImgsz) return `${API_BASE_URL}/detect`
+  const url = new URL(`${API_BASE_URL}/detect`)
+  url.searchParams.set('imgsz', String(modelImgsz))
+  return url.toString()
+}
+
 export async function detectPeople(
   file: File | Blob,
-  options?: { filename?: string; signal?: AbortSignal },
+  options?: DetectPeopleOptions,
 ): Promise<DetectionResponse> {
+  const result = await detectPeopleInstrumented(file, options)
+  return result.response
+}
+
+export async function detectPeopleInstrumented(
+  file: File | Blob,
+  options?: DetectPeopleOptions,
+): Promise<DetectPeopleResult> {
   const formData = new FormData()
-  const filename = options?.filename ?? (file instanceof File ? file.name : 'frame.jpg')
+  const filename =
+    options?.filename ?? (file instanceof File ? file.name : 'frame.jpg')
   formData.append('file', file, filename)
 
+  const requestStarted = performance.now()
   const response = await fetchWithTimeout(
-    `${API_BASE_URL}/detect`,
+    buildDetectUrl(options?.modelImgsz),
     {
       method: 'POST',
       body: formData,
@@ -131,8 +161,11 @@ export async function detectPeople(
   if (!response.ok) {
     let detail = `Detection failed (${response.status}).`
     try {
-      const errorBody = (await response.json()) as { detail?: string; message?: string }
-      if (errorBody.detail) detail = errorBody.detail
+      const errorBody = (await response.json()) as {
+        detail?: string
+        message?: string
+      }
+      if (errorBody.detail) detail = String(errorBody.detail)
       else if (errorBody.message) detail = errorBody.message
     } catch {
       // ignore JSON parse failures on error bodies
@@ -140,16 +173,37 @@ export async function detectPeople(
     throw new ApiError(detail, response.status)
   }
 
+  const parseStarted = performance.now()
   let data: unknown
   try {
     data = await response.json()
   } catch {
     throw new ApiError('Detection API returned an invalid response.')
   }
+  const parseMs = performance.now() - parseStarted
+  const requestTotalMs = performance.now() - requestStarted
 
   if (!isValidDetectionResponse(data)) {
     throw new ApiError('Detection API returned an unexpected response format.')
   }
 
-  return data
+  const modelImgsz =
+    typeof (data as DetectionResponse & { model_imgsz?: number }).model_imgsz ===
+    'number'
+      ? (data as DetectionResponse & { model_imgsz?: number }).model_imgsz!
+      : null
+
+  const serverInferenceMs = data.inference_ms
+  const nonInferenceOverheadMs = Math.max(0, requestTotalMs - serverInferenceMs)
+
+  return {
+    response: data,
+    timing: {
+      requestTotalMs,
+      parseMs,
+      serverInferenceMs,
+      nonInferenceOverheadMs,
+      modelImgsz,
+    },
+  }
 }

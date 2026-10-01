@@ -15,6 +15,11 @@ dist-ssr
 .env.*.local
 test-aerial.jpg
 sample-aerial.jpg
+benchmark-capture-widths.json
+bench-*.jpg
+live-detection-test-*.json
+live-detection-test-*.csv
+live-capture-benchmark-*.json
 
 # Editor directories and files
 .vscode/*
