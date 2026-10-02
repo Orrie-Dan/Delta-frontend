@@ -10,7 +10,7 @@ export function LoadingState({
       <div className="loading-state__spinner" aria-hidden="true" />
       <p className="loading-state__message">{message}</p>
       <p className="loading-state__sub">
-        Running YOLO26s person detection on the uploaded image.
+        Running YOLO26s browser ONNX detection on the uploaded image.
       </p>
     </div>
   )

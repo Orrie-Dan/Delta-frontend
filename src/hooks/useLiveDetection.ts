@@ -5,13 +5,9 @@ import {
   useState,
   type RefObject,
 } from 'react'
-import { ApiError, detectPeopleInstrumented } from '../api/detection'
-import { captureVideoFrame } from '../lib/captureFrame'
 import {
-  BENCHMARK_SAMPLES_DEFAULT,
   DEFAULT_LIVE_CAPTURE_WIDTH,
   DEFAULT_LIVE_JPEG_QUALITY,
-  DEPLOYED_MODEL_IMGSZ,
   DETECTION_FPS_WINDOW_MS,
   type LiveCaptureWidth,
   type LiveJpegQuality,
@@ -19,21 +15,50 @@ import {
   type TestScenario,
 } from '../lib/liveConfig'
 import type {
-  BenchmarkConfigSummary,
-  BenchmarkSample,
   LiveDiagnosticsSnapshot,
   LiveFrameMetrics,
   QualityMarkerEvent,
   TestSessionExport,
 } from '../lib/liveTypes'
-import { average, averageNullable, median, percentile95 } from '../lib/stats'
+import { runIsolatedBrowserInference } from '../lib/onnxInference'
+import {
+  LIVE_WEBGPU_IMGSZ,
+  endWebGpuInference,
+  getWebGpuInferenceOptions,
+  getWebGpuInferenceSlots,
+  getWebGpuModelFetchCount,
+  getWebGpuRuntimeSnapshot,
+  getWebGpuSessionCreations,
+  tryBeginWebGpuInference,
+} from '../lib/onnxWebGpu'
+import { median, percentile95 } from '../lib/stats'
 import type {
   CameraLifecycle,
   DetectionResponse,
   LiveDetectionStats,
 } from '../types/detection'
 
-const LOOP_GAP_MS = 40
+const WEBGPU_REQUIRED_MESSAGE =
+  'Live detection requires WebGPU on this device/browser.'
+
+export interface LiveInferenceDebugStats {
+  completed: number
+  dropped: number
+  latestInferenceMs: number | null
+  latestTotalMs: number | null
+  medianInferenceMs: number | null
+  medianTotalMs: number | null
+  p95TotalMs: number | null
+  effectiveFps: number | null
+  maxConcurrentInference: number
+  activeInFlight: number
+  sessionIdentity: number | null
+  modelImgsz: number
+  executionProvider: 'webgpu'
+  sessionStartedAtMs: number | null
+  modelFetchCount: number
+  sessionCreations: number
+}
 
 interface UseLiveDetectionOptions {
   enabled: boolean
@@ -58,17 +83,12 @@ interface UseLiveDetectionResult {
   lastRequestId: number | null
   sessionRecords: LiveFrameMetrics[]
   sessionMarkers: QualityMarkerEvent[]
-  benchmarkRunning: boolean
-  benchmarkProgress: string | null
-  benchmarkSummaries: BenchmarkConfigSummary[]
-  benchmarkSamples: BenchmarkSample[]
   startCamera: (deviceId?: string) => Promise<void>
   stopCamera: () => void
   switchCamera: () => Promise<void>
   addQualityMarker: (type: QualityMarkerType) => void
   clearSessionData: () => void
   exportSession: () => TestSessionExport | null
-  runCaptureWidthBenchmark: (samplesPerConfig?: number) => Promise<void>
 }
 
 function classifyCameraError(error: unknown): {
@@ -128,37 +148,6 @@ function averageConfidence(
   )
 }
 
-function summarizeBenchmark(
-  captureWidth: number,
-  samples: BenchmarkSample[],
-): BenchmarkConfigSummary {
-  const totals = samples.map((s) => s.requestTotalMs)
-  const servers = samples.map((s) => s.serverInferenceMs)
-  const payloads = samples.map((s) => s.payloadKb)
-  const people = samples.map((s) => s.peopleReturned)
-  const confidences = samples.map((s) => s.averageConfidence)
-  const avgTotal = average(totals)
-
-  return {
-    captureWidth,
-    modelImgsz: samples[0]?.modelImgsz ?? DEPLOYED_MODEL_IMGSZ,
-    samples: samples.length,
-    avgPayloadKb: average(payloads),
-    avgCaptureMs: average(samples.map((s) => s.captureMs)),
-    avgEncodeMs: average(samples.map((s) => s.encodeMs)),
-    avgRequestTotalMs: avgTotal,
-    medianRequestTotalMs: median(totals),
-    p95RequestTotalMs: percentile95(totals),
-    avgServerInferenceMs: average(servers),
-    avgNonInferenceOverheadMs: average(
-      samples.map((s) => s.nonInferenceOverheadMs),
-    ),
-    avgPeopleReturned: average(people),
-    avgConfidence: averageNullable(confidences),
-    effectiveDetectionFps: avgTotal > 0 ? 1000 / avgTotal : 0,
-  }
-}
-
 export function useLiveDetection({
   enabled,
   captureWidth,
@@ -169,7 +158,6 @@ export function useLiveDetection({
 }: UseLiveDetectionOptions): UseLiveDetectionResult {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
-  const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const runningRef = useRef(false)
   const inFlightRef = useRef(false)
   const activeRequestsRef = useRef(0)
@@ -179,6 +167,18 @@ export function useLiveDetection({
   const abortRef = useRef<AbortController | null>(null)
   const completionTimestampsRef = useRef<number[]>([])
   const loopTimerRef = useRef<number | null>(null)
+  const detectionRafRef = useRef<number | null>(null)
+  const completedRef = useRef(0)
+  const droppedRef = useRef(0)
+  const maxConcurrentRef = useRef(0)
+  const liveStartedAtRef = useRef<number | null>(null)
+  const inferenceSamplesRef = useRef<number[]>([])
+  const totalSamplesRef = useRef<number[]>([])
+  const latestInferenceMsRef = useRef<number | null>(null)
+  const latestTotalMsRef = useRef<number | null>(null)
+  const sessionIdentityRef = useRef<number | null>(null)
+  const lastDropUiRef = useRef(0)
+  const webGpuBlockedRef = useRef(false)
   const captureWidthRef = useRef(captureWidth)
   const jpegQualityRef = useRef(jpegQuality)
   const confidenceRef = useRef(confidenceThreshold)
@@ -222,18 +222,19 @@ export function useLiveDetection({
     activeRequests: 0,
     currentCaptureWidthSetting: captureWidth,
     currentJpegQuality: jpegQuality,
-    modelImgsz: DEPLOYED_MODEL_IMGSZ,
+    modelImgsz: LIVE_WEBGPU_IMGSZ,
+    completedInferences: 0,
+    droppedFrames: 0,
+    latestInferenceMs: null,
+    medianInferenceMs: null,
+    medianTotalMs: null,
+    effectiveInferenceFps: null,
+    maxConcurrentInference: 0,
   })
   const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([])
   const [activeDeviceId, setActiveDeviceId] = useState<string | null>(null)
   const [sessionRecords, setSessionRecords] = useState<LiveFrameMetrics[]>([])
   const [sessionMarkers, setSessionMarkers] = useState<QualityMarkerEvent[]>([])
-  const [benchmarkRunning, setBenchmarkRunning] = useState(false)
-  const [benchmarkProgress, setBenchmarkProgress] = useState<string | null>(null)
-  const [benchmarkSummaries, setBenchmarkSummaries] = useState<
-    BenchmarkConfigSummary[]
-  >([])
-  const [benchmarkSamples, setBenchmarkSamples] = useState<BenchmarkSample[]>([])
   const sessionStartedAtRef = useRef<string | null>(null)
 
   useEffect(() => {
@@ -318,10 +319,18 @@ export function useLiveDetection({
     }
   }, [])
 
+  const stopDetectionLoop = useCallback(() => {
+    if (detectionRafRef.current !== null) {
+      cancelAnimationFrame(detectionRafRef.current)
+      detectionRafRef.current = null
+    }
+    clearLoopTimer()
+  }, [clearLoopTimer])
+
   const stopCamera = useCallback(() => {
     runningRef.current = false
     pauseLoopRef.current = false
-    clearLoopTimer()
+    stopDetectionLoop()
     abortRef.current?.abort()
     abortRef.current = null
     setInFlight(false)
@@ -329,6 +338,16 @@ export function useLiveDetection({
     requestSeqRef.current = 0
     appliedSeqRef.current = 0
     completionTimestampsRef.current = []
+    completedRef.current = 0
+    droppedRef.current = 0
+    maxConcurrentRef.current = 0
+    liveStartedAtRef.current = null
+    inferenceSamplesRef.current = []
+    totalSamplesRef.current = []
+    latestInferenceMsRef.current = null
+    latestTotalMsRef.current = null
+    sessionIdentityRef.current = null
+    webGpuBlockedRef.current = false
     stopCameraFpsMonitor()
     stopTracks()
     setIsDetecting(false)
@@ -360,10 +379,18 @@ export function useLiveDetection({
       visibleDetections: 0,
       returnedDetections: 0,
       activeRequests: 0,
+      completedInferences: 0,
+      droppedFrames: 0,
+      latestInferenceMs: null,
+      medianInferenceMs: null,
+      medianTotalMs: null,
+      effectiveInferenceFps: null,
+      maxConcurrentInference: 0,
+      modelImgsz: LIVE_WEBGPU_IMGSZ,
     }))
     setCameraState('off')
     setActiveDeviceId(null)
-  }, [clearLoopTimer, setInFlight, stopCameraFpsMonitor, stopTracks])
+  }, [setInFlight, stopCameraFpsMonitor, stopDetectionLoop, stopTracks])
 
   const refreshDevices = useCallback(async () => {
     if (!navigator.mediaDevices?.enumerateDevices) {
@@ -378,175 +405,254 @@ export function useLiveDetection({
     }
   }, [])
 
+  const publishDebugStats = useCallback(() => {
+    const started = liveStartedAtRef.current
+    const elapsedSec =
+      started == null ? 0 : Math.max(0, (performance.now() - started) / 1000)
+    const inferenceSamples = inferenceSamplesRef.current
+    const totalSamples = totalSamplesRef.current
+    const stats: LiveInferenceDebugStats = {
+      completed: completedRef.current,
+      dropped: droppedRef.current,
+      latestInferenceMs: latestInferenceMsRef.current,
+      latestTotalMs: latestTotalMsRef.current,
+      medianInferenceMs:
+        inferenceSamples.length > 0 ? median(inferenceSamples) : null,
+      medianTotalMs: totalSamples.length > 0 ? median(totalSamples) : null,
+      p95TotalMs: percentile95(totalSamples),
+      effectiveFps:
+        elapsedSec > 0 ? completedRef.current / elapsedSec : null,
+      maxConcurrentInference: maxConcurrentRef.current,
+      activeInFlight: getWebGpuInferenceSlots(),
+      sessionIdentity: sessionIdentityRef.current,
+      modelImgsz: LIVE_WEBGPU_IMGSZ,
+      executionProvider: 'webgpu',
+      sessionStartedAtMs: started,
+      modelFetchCount: getWebGpuModelFetchCount(),
+      sessionCreations: getWebGpuSessionCreations(),
+    }
+    ;(
+      window as Window & { __liveInferenceStats?: LiveInferenceDebugStats }
+    ).__liveInferenceStats = stats
+    return stats
+  }, [])
+
   const runDetectionLoop = useCallback(
-    async (sessionId: number) => {
-      if (!runningRef.current || sessionId !== sessionIdRef.current) return
-      if (pauseLoopRef.current) {
-        loopTimerRef.current = window.setTimeout(() => {
-          void runDetectionLoop(sessionId)
-        }, 200)
-        return
-      }
-      if (inFlightRef.current) return
-
-      const video = videoRef.current
-      if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-        loopTimerRef.current = window.setTimeout(() => {
-          void runDetectionLoop(sessionId)
-        }, 120)
-        return
+    (sessionId: number) => {
+      const schedule = () => {
+        detectionRafRef.current = requestAnimationFrame(tick)
       }
 
-      if (!canvasRef.current) {
-        canvasRef.current = document.createElement('canvas')
-      }
-
-      setInFlight(true)
-      setIsDetecting(true)
-      const requestId = ++requestSeqRef.current
-      const abortController = new AbortController()
-      abortRef.current = abortController
-
-      try {
-        const capture = await captureVideoFrame(video, canvasRef.current, {
-          captureWidth: captureWidthRef.current,
-          jpegQuality: jpegQualityRef.current,
-        })
-
+      const tick = () => {
         if (!runningRef.current || sessionId !== sessionIdRef.current) return
 
-        const { response, timing } = await detectPeopleInstrumented(capture.blob, {
-          filename: 'frame.jpg',
-          signal: abortController.signal,
-        })
-
-        // Blob is not retained after this function scope ends.
-        if (!runningRef.current || sessionId !== sessionIdRef.current) return
-        if (requestId < appliedSeqRef.current) return
-
-        appliedSeqRef.current = requestId
-        setLastRequestId(requestId)
-        setResult(response)
-        setErrorMessage(null)
-
-        const now = performance.now()
-        completionTimestampsRef.current.push(now)
-        completionTimestampsRef.current = completionTimestampsRef.current.filter(
-          (ts) => now - ts <= DETECTION_FPS_WINDOW_MS,
-        )
-        const detectionFps = computeDetectionFps(
-          completionTimestampsRef.current,
-          now,
-        )
-        const visible = response.detections.filter(
-          (d) => d.confidence >= confidenceRef.current,
-        ).length
-        const avgConf = averageConfidence(response.detections)
-
-        setLiveStats({
-          people: response.people,
-          inferenceMs: timing.serverInferenceMs,
-          requestTotalMs: timing.requestTotalMs,
-          detectionFps,
-          cameraFps: cameraFpsRef.current,
-        })
-
-        const metrics: LiveFrameMetrics = {
-          requestId,
-          sessionId,
-          timestamp: new Date().toISOString(),
-          sourceWidth: capture.sourceWidth,
-          sourceHeight: capture.sourceHeight,
-          captureWidth: capture.captureWidth,
-          captureHeight: capture.captureHeight,
-          jpegQuality: jpegQualityRef.current,
-          payloadBytes: capture.payloadBytes,
-          payloadKb: capture.payloadBytes / 1024,
-          captureMs: capture.captureMs,
-          encodeMs: capture.encodeMs,
-          requestTotalMs: timing.requestTotalMs,
-          serverInferenceMs: timing.serverInferenceMs,
-          nonInferenceOverheadMs: timing.nonInferenceOverheadMs,
-          parseMs: timing.parseMs,
-          peopleReturned: response.people,
-          visibleDetections: visible,
-          averageConfidence: avgConf,
-          modelImgsz: timing.modelImgsz ?? DEPLOYED_MODEL_IMGSZ,
-          detectionFps,
-          cameraFps: cameraFpsRef.current,
-          activeRequests: 1,
-          confidenceThreshold: confidenceRef.current,
-        }
-
-        setDiagnostics({
-          cameraWidth: capture.sourceWidth,
-          cameraHeight: capture.sourceHeight,
-          captureWidth: capture.captureWidth,
-          captureHeight: capture.captureHeight,
-          payloadKb: metrics.payloadKb,
-          captureMs: metrics.captureMs,
-          encodeMs: metrics.encodeMs,
-          requestTotalMs: metrics.requestTotalMs,
-          serverInferenceMs: metrics.serverInferenceMs,
-          nonInferenceOverheadMs: metrics.nonInferenceOverheadMs,
-          detectionFps,
-          cameraFps: cameraFpsRef.current,
-          visibleDetections: visible,
-          returnedDetections: response.people,
-          confidenceThreshold: confidenceRef.current,
-          activeRequests: 1,
-          currentCaptureWidthSetting: captureWidthRef.current,
-          currentJpegQuality: jpegQualityRef.current,
-          modelImgsz: metrics.modelImgsz,
-        })
-
-        if (recordingRef.current) {
-          setSessionRecords((prev) => [...prev, metrics])
-        }
-
-        if (import.meta.env.DEV) {
-          console.debug('[live] detect complete', {
-            requestId,
-            activeRequests: activeRequestsRef.current,
-            capture: `${capture.captureWidth}x${capture.captureHeight}`,
-            payloadKb: metrics.payloadKb.toFixed(1),
-            requestTotalMs: metrics.requestTotalMs.toFixed(0),
-            serverMs: metrics.serverInferenceMs.toFixed(0),
-          })
-        }
-      } catch (error) {
-        if (!runningRef.current || sessionId !== sessionIdRef.current) return
-        if (error instanceof ApiError && error.message.includes('cancelled')) {
+        if (pauseLoopRef.current) {
+          loopTimerRef.current = window.setTimeout(schedule, 200)
           return
         }
 
-        const message =
-          error instanceof ApiError
-            ? error.message
-            : error instanceof Error
-              ? error.message
-              : 'Live detection failed.'
-
-        setErrorMessage(message)
-      } finally {
-        if (abortRef.current === abortController) {
-          abortRef.current = null
-        }
-        setInFlight(false)
-        if (sessionId === sessionIdRef.current) {
-          setIsDetecting(false)
-          setDiagnostics((prev) => ({ ...prev, activeRequests: 0 }))
+        const video = videoRef.current
+        if (!video || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+          schedule()
+          return
         }
 
-        if (runningRef.current && sessionId === sessionIdRef.current) {
-          clearLoopTimer()
-          loopTimerRef.current = window.setTimeout(() => {
-            void runDetectionLoop(sessionId)
-          }, LOOP_GAP_MS)
+        schedule()
+
+        const runtime = getWebGpuInferenceOptions()
+        if (!runtime) {
+          if (!webGpuBlockedRef.current) {
+            webGpuBlockedRef.current = true
+            setErrorMessage(WEBGPU_REQUIRED_MESSAGE)
+          }
+          return
         }
+
+        if (inFlightRef.current || !tryBeginWebGpuInference()) {
+          droppedRef.current += 1
+          if (import.meta.env.DEV) {
+            const liveStats = (
+              window as Window & { __liveInferenceStats?: LiveInferenceDebugStats }
+            ).__liveInferenceStats
+            if (liveStats) liveStats.dropped = droppedRef.current
+          }
+          const now = performance.now()
+          if (now - lastDropUiRef.current >= 500) {
+            lastDropUiRef.current = now
+            const stats = publishDebugStats()
+            setDiagnostics((prev) => ({
+              ...prev,
+              droppedFrames: stats.dropped,
+              completedInferences: stats.completed,
+              effectiveInferenceFps: stats.effectiveFps,
+              maxConcurrentInference: stats.maxConcurrentInference,
+              activeRequests: inFlightRef.current ? 1 : 0,
+            }))
+          }
+          return
+        }
+
+        inFlightRef.current = true
+        activeRequestsRef.current = 1
+        maxConcurrentRef.current = Math.max(
+          maxConcurrentRef.current,
+          getWebGpuInferenceSlots(),
+        )
+        setInFlight(true)
+        setIsDetecting(true)
+        const requestId = ++requestSeqRef.current
+
+        void (async () => {
+          let releaseSlot = true
+          try {
+            const result = await runIsolatedBrowserInference(video, {
+              ...runtime,
+              modelImgsz: LIVE_WEBGPU_IMGSZ,
+            })
+
+            if (!runningRef.current || sessionId !== sessionIdRef.current) return
+            if (requestId < appliedSeqRef.current) return
+
+            const { response, timing, diagnostics: inferenceDiagnostics } = result
+            appliedSeqRef.current = requestId
+            completedRef.current += 1
+            latestInferenceMsRef.current = timing.inferenceMs
+            latestTotalMsRef.current = timing.totalMs
+            inferenceSamplesRef.current.push(timing.inferenceMs)
+            totalSamplesRef.current.push(timing.totalMs)
+            sessionIdentityRef.current = inferenceDiagnostics.sessionIdentity
+            const debugStats = publishDebugStats()
+
+            setLastRequestId(requestId)
+            setResult(response)
+            setErrorMessage(null)
+
+            const now = performance.now()
+            completionTimestampsRef.current.push(now)
+            completionTimestampsRef.current =
+              completionTimestampsRef.current.filter(
+                (ts) => now - ts <= DETECTION_FPS_WINDOW_MS,
+              )
+            const detectionFps = computeDetectionFps(
+              completionTimestampsRef.current,
+              now,
+            )
+            const visible = response.detections.filter(
+              (d) => d.confidence >= confidenceRef.current,
+            ).length
+            const avgConf = averageConfidence(response.detections)
+            const sourceWidth = video.videoWidth
+            const sourceHeight = video.videoHeight
+
+            setLiveStats({
+              people: response.people,
+              inferenceMs: timing.inferenceMs,
+              requestTotalMs: timing.totalMs,
+              detectionFps,
+              cameraFps: cameraFpsRef.current,
+            })
+
+            const metrics: LiveFrameMetrics = {
+              requestId,
+              sessionId,
+              timestamp: new Date().toISOString(),
+              sourceWidth,
+              sourceHeight,
+              captureWidth: inferenceDiagnostics.letterbox.canvasWidth,
+              captureHeight: inferenceDiagnostics.letterbox.canvasHeight,
+              jpegQuality: jpegQualityRef.current,
+              payloadBytes: 0,
+              payloadKb: 0,
+              captureMs: timing.preprocessMs,
+              encodeMs: 0,
+              requestTotalMs: timing.totalMs,
+              serverInferenceMs: timing.inferenceMs,
+              nonInferenceOverheadMs:
+                timing.preprocessMs + timing.postprocessMs,
+              parseMs: timing.postprocessMs,
+              peopleReturned: response.people,
+              visibleDetections: visible,
+              averageConfidence: avgConf,
+              modelImgsz: LIVE_WEBGPU_IMGSZ,
+              detectionFps,
+              cameraFps: cameraFpsRef.current,
+              activeRequests: 1,
+              confidenceThreshold: confidenceRef.current,
+            }
+
+            setDiagnostics({
+              cameraWidth: sourceWidth,
+              cameraHeight: sourceHeight,
+              captureWidth: inferenceDiagnostics.letterbox.canvasWidth,
+              captureHeight: inferenceDiagnostics.letterbox.canvasHeight,
+              payloadKb: null,
+              captureMs: timing.preprocessMs,
+              encodeMs: null,
+              requestTotalMs: timing.totalMs,
+              serverInferenceMs: timing.inferenceMs,
+              nonInferenceOverheadMs:
+                timing.preprocessMs + timing.postprocessMs,
+              detectionFps,
+              cameraFps: cameraFpsRef.current,
+              visibleDetections: visible,
+              returnedDetections: response.people,
+              confidenceThreshold: confidenceRef.current,
+              activeRequests: 1,
+              currentCaptureWidthSetting: captureWidthRef.current,
+              currentJpegQuality: jpegQualityRef.current,
+              modelImgsz: LIVE_WEBGPU_IMGSZ,
+              completedInferences: debugStats.completed,
+              droppedFrames: debugStats.dropped,
+              latestInferenceMs: debugStats.latestInferenceMs,
+              medianInferenceMs: debugStats.medianInferenceMs,
+              medianTotalMs: debugStats.medianTotalMs,
+              effectiveInferenceFps: debugStats.effectiveFps,
+              maxConcurrentInference: debugStats.maxConcurrentInference,
+            })
+
+            if (recordingRef.current) {
+              setSessionRecords((prev) => [...prev, metrics])
+            }
+
+            if (import.meta.env.DEV) {
+              console.debug('[live] webgpu detect complete', {
+                requestId,
+                activeRequests: activeRequestsRef.current,
+                imgsz: LIVE_WEBGPU_IMGSZ,
+                tensor: `${inferenceDiagnostics.letterbox.canvasWidth}x${inferenceDiagnostics.letterbox.canvasHeight}`,
+                inferenceMs: timing.inferenceMs.toFixed(0),
+                totalMs: timing.totalMs.toFixed(0),
+                completed: debugStats.completed,
+                dropped: debugStats.dropped,
+                sessionIdentity: inferenceDiagnostics.sessionIdentity,
+              })
+            }
+          } catch (error) {
+            if (!runningRef.current || sessionId !== sessionIdRef.current) return
+            const message =
+              error instanceof Error ? error.message : 'Live detection failed.'
+            setErrorMessage(message)
+          } finally {
+            if (releaseSlot) {
+              endWebGpuInference()
+              releaseSlot = false
+            }
+            if (sessionId === sessionIdRef.current) {
+              setInFlight(false)
+              setIsDetecting(false)
+              setDiagnostics((prev) => ({ ...prev, activeRequests: 0 }))
+            } else {
+              inFlightRef.current = false
+              activeRequestsRef.current = 0
+            }
+          }
+        })()
       }
+
+      stopDetectionLoop()
+      schedule()
     },
-    [clearLoopTimer, setInFlight],
+    [publishDebugStats, setInFlight, stopDetectionLoop],
   )
 
   const startCamera = useCallback(
@@ -554,6 +660,17 @@ export function useLiveDetection({
       if (!navigator.mediaDevices?.getUserMedia) {
         setCameraState('unavailable')
         setErrorMessage('Camera APIs are not available in this browser.')
+        return
+      }
+
+      const webGpuStatus = getWebGpuRuntimeSnapshot().status
+      if (webGpuStatus !== 'ready') {
+        stopCamera()
+        setErrorMessage(
+          webGpuStatus === 'loading'
+            ? 'WebGPU runtime is still loading.'
+            : WEBGPU_REQUIRED_MESSAGE,
+        )
         return
       }
 
@@ -604,6 +721,7 @@ export function useLiveDetection({
         pauseLoopRef.current = false
 
         setCameraState('active')
+        liveStartedAtRef.current = performance.now()
         setResult(null)
         setLiveStats({
           people: 0,
@@ -651,7 +769,7 @@ export function useLiveDetection({
         peopleCount: result?.people ?? 0,
         captureWidth: captureWidthRef.current,
         jpegQuality: jpegQualityRef.current,
-        modelImgsz: DEPLOYED_MODEL_IMGSZ,
+        modelImgsz: LIVE_WEBGPU_IMGSZ,
         scenario: scenarioRef.current,
       }
       setSessionMarkers((prev) => [...prev, marker])
@@ -674,99 +792,11 @@ export function useLiveDetection({
       scenario: scenarioRef.current,
       captureWidth: captureWidthRef.current,
       jpegQuality: jpegQualityRef.current,
-      modelImgszNote: `Deployed backend fixed at imgsz=${DEPLOYED_MODEL_IMGSZ} (not configurable from this frontend).`,
+      modelImgszNote: `Browser WebGPU live detection at imgsz=${LIVE_WEBGPU_IMGSZ}. Frames are not uploaded.`,
       records: sessionRecords,
       markers: sessionMarkers,
     }
   }, [sessionMarkers, sessionRecords])
-
-  const runCaptureWidthBenchmark = useCallback(
-    async (samplesPerConfig = BENCHMARK_SAMPLES_DEFAULT) => {
-      if (benchmarkRunning) return
-      const video = videoRef.current
-      if (!video || cameraState !== 'active') {
-        setErrorMessage('Start the camera before running a live benchmark.')
-        return
-      }
-      if (!canvasRef.current) {
-        canvasRef.current = document.createElement('canvas')
-      }
-
-      setBenchmarkRunning(true)
-      pauseLoopRef.current = true
-      setBenchmarkProgress('Starting capture-width benchmark…')
-      setBenchmarkSummaries([])
-      setBenchmarkSamples([])
-
-      const widths: LiveCaptureWidth[] = [640, 768, 960, 1280]
-      const allSamples: BenchmarkSample[] = []
-      const summaries: BenchmarkConfigSummary[] = []
-
-      try {
-        for (const width of widths) {
-          const configSamples: BenchmarkSample[] = []
-          for (let i = 0; i < samplesPerConfig; i += 1) {
-            if (inFlightRef.current) {
-              throw new Error('Benchmark refused to start while a request is in flight.')
-            }
-
-            setBenchmarkProgress(
-              `Capture width ${width} — sample ${i + 1}/${samplesPerConfig}`,
-            )
-            setInFlight(true)
-
-            try {
-              const capture = await captureVideoFrame(video, canvasRef.current, {
-                captureWidth: width,
-                jpegQuality: jpegQualityRef.current,
-              })
-              const { response, timing } = await detectPeopleInstrumented(
-                capture.blob,
-                { filename: 'frame.jpg' },
-              )
-
-              const sample: BenchmarkSample = {
-                captureWidth: capture.captureWidth,
-                captureHeight: capture.captureHeight,
-                jpegQuality: jpegQualityRef.current,
-                modelImgsz: timing.modelImgsz ?? DEPLOYED_MODEL_IMGSZ,
-                payloadKb: capture.payloadBytes / 1024,
-                captureMs: capture.captureMs,
-                encodeMs: capture.encodeMs,
-                requestTotalMs: timing.requestTotalMs,
-                serverInferenceMs: timing.serverInferenceMs,
-                nonInferenceOverheadMs: timing.nonInferenceOverheadMs,
-                peopleReturned: response.people,
-                averageConfidence: averageConfidence(response.detections),
-                timestamp: new Date().toISOString(),
-              }
-              configSamples.push(sample)
-              allSamples.push(sample)
-            } finally {
-              setInFlight(false)
-            }
-          }
-          summaries.push(summarizeBenchmark(width, configSamples))
-        }
-
-        setBenchmarkSamples(allSamples)
-        setBenchmarkSummaries(summaries)
-        setBenchmarkProgress('Benchmark complete')
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : 'Benchmark failed.'
-        setErrorMessage(message)
-        setBenchmarkProgress('Benchmark failed')
-      } finally {
-        pauseLoopRef.current = false
-        setBenchmarkRunning(false)
-        if (runningRef.current) {
-          void runDetectionLoop(sessionIdRef.current)
-        }
-      }
-    },
-    [benchmarkRunning, cameraState, runDetectionLoop, setInFlight],
-  )
 
   useEffect(() => {
     if (!enabled && runningRef.current) {
@@ -777,12 +807,12 @@ export function useLiveDetection({
   useEffect(() => {
     return () => {
       runningRef.current = false
-      clearLoopTimer()
+      stopDetectionLoop()
       abortRef.current?.abort()
       stopCameraFpsMonitor()
       stopTracks()
     }
-  }, [clearLoopTimer, stopCameraFpsMonitor, stopTracks])
+  }, [stopCameraFpsMonitor, stopDetectionLoop, stopTracks])
 
   return {
     videoRef,
@@ -798,17 +828,12 @@ export function useLiveDetection({
     lastRequestId,
     sessionRecords,
     sessionMarkers,
-    benchmarkRunning,
-    benchmarkProgress,
-    benchmarkSummaries,
-    benchmarkSamples,
     startCamera,
     stopCamera,
     switchCamera,
     addQualityMarker,
     clearSessionData,
     exportSession,
-    runCaptureWidthBenchmark,
   }
 }
 

@@ -10,10 +10,9 @@ export const DEFAULT_LIVE_JPEG_QUALITY: LiveJpegQuality = 0.75
 export const MODEL_IMGSZ_OPTIONS = [640, 768, 960, 1280] as const
 export type ModelImgsz = (typeof MODEL_IMGSZ_OPTIONS)[number]
 
-/** Deployed backend currently uses imgsz=1280; frontend cannot change it. */
-export const DEPLOYED_MODEL_IMGSZ: ModelImgsz = 1280
+/** Static upload browser WASM path uses imgsz=1280. Live WebGPU uses 960. */
+export const STATIC_MODEL_IMGSZ: ModelImgsz = 1280
 
-export const BENCHMARK_SAMPLES_DEFAULT = 5
 export const DETECTION_FPS_WINDOW_MS = 10_000
 
 export const PERFORMANCE_TARGETS = {

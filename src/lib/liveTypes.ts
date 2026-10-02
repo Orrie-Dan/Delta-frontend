@@ -1,30 +1,9 @@
-import type { Detection, DetectionResponse } from '../types/detection'
 import type {
   LiveCaptureWidth,
   LiveJpegQuality,
   QualityMarkerType,
   TestScenario,
 } from './liveConfig'
-
-export interface FrameCaptureMetrics {
-  blob: Blob
-  sourceWidth: number
-  sourceHeight: number
-  captureWidth: number
-  captureHeight: number
-  captureMs: number
-  encodeMs: number
-  payloadBytes: number
-}
-
-export interface RequestTimingMetrics {
-  requestTotalMs: number
-  parseMs: number
-  serverInferenceMs: number
-  /** Approximate: request_total_ms - server_inference_ms (includes HTTP, decode, serialize, etc.) */
-  nonInferenceOverheadMs: number
-  modelImgsz: number | null
-}
 
 export interface LiveFrameMetrics {
   requestId: number
@@ -73,39 +52,13 @@ export interface LiveDiagnosticsSnapshot {
   currentCaptureWidthSetting: LiveCaptureWidth
   currentJpegQuality: LiveJpegQuality
   modelImgsz: number | null
-}
-
-export interface BenchmarkSample {
-  captureWidth: number
-  captureHeight: number
-  jpegQuality: number
-  modelImgsz: number | null
-  payloadKb: number
-  captureMs: number
-  encodeMs: number
-  requestTotalMs: number
-  serverInferenceMs: number
-  nonInferenceOverheadMs: number
-  peopleReturned: number
-  averageConfidence: number | null
-  timestamp: string
-}
-
-export interface BenchmarkConfigSummary {
-  captureWidth: number
-  modelImgsz: number | null
-  samples: number
-  avgPayloadKb: number
-  avgCaptureMs: number
-  avgEncodeMs: number
-  avgRequestTotalMs: number
-  medianRequestTotalMs: number
-  p95RequestTotalMs: number | null
-  avgServerInferenceMs: number
-  avgNonInferenceOverheadMs: number
-  avgPeopleReturned: number
-  avgConfidence: number | null
-  effectiveDetectionFps: number
+  completedInferences: number
+  droppedFrames: number
+  latestInferenceMs: number | null
+  medianInferenceMs: number | null
+  medianTotalMs: number | null
+  effectiveInferenceFps: number | null
+  maxConcurrentInference: number
 }
 
 export interface QualityMarkerEvent {
@@ -123,11 +76,9 @@ export interface TestSessionExport {
   startedAt: string
   stoppedAt: string
   scenario: TestScenario
-  captureWidth: LiveCaptureWidth
-  jpegQuality: LiveJpegQuality
+  captureWidth: number
+  jpegQuality: number
   modelImgszNote: string
   records: LiveFrameMetrics[]
   markers: QualityMarkerEvent[]
 }
-
-export type { Detection, DetectionResponse }

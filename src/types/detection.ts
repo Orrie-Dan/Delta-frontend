@@ -16,17 +16,9 @@ export interface DetectionResponse {
   inference_ms: number
   image: DetectionImage
   detections: Detection[]
-  /** Present only if backend supports configurable imgsz. */
+  /** Present when browser inference reports the requested imgsz. */
   model_imgsz?: number
 }
-
-export interface HealthResponse {
-  status: string
-  model: string
-  image_size: number
-}
-
-export type ApiStatus = 'checking' | 'online' | 'offline'
 
 export type AppPhase = 'upload' | 'preview' | 'detecting' | 'results' | 'error'
 

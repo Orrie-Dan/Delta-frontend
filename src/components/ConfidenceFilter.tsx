@@ -42,7 +42,7 @@ export function ConfidenceFilter({
       />
 
       <p className="confidence-filter__hint">
-        Filters detections already returned by the server. Backend minimum is
+        Filters detections already returned by the detector. Pipeline minimum is
         25%.
       </p>
     </div>

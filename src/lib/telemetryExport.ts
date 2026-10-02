@@ -112,16 +112,3 @@ export function exportTestSessionCsv(session: TestSessionExport) {
   const blob = new Blob([rows.join('\n')], { type: 'text/csv;charset=utf-8' })
   downloadBlob(blob, filename)
 }
-
-export function exportBenchmarkJson(
-  summaries: unknown,
-  samples: unknown,
-  startedAt: string,
-) {
-  const filename = `live-capture-benchmark-${sessionStamp(startedAt)}.json`
-  const blob = new Blob(
-    [JSON.stringify({ startedAt, summaries, samples }, null, 2)],
-    { type: 'application/json' },
-  )
-  downloadBlob(blob, filename)
-}

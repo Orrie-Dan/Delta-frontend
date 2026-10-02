@@ -1,22 +1,18 @@
 # Person Detection Demo Frontend
 
-Polished React + Vite + TypeScript frontend for the deployed YOLO26s aerial person-detection MVP.
+React + Vite + TypeScript frontend for YOLO26s aerial person detection.
+Inference runs entirely in the browser with ONNX Runtime Web.
 
 ## Quick start
 
 ```bash
 npm install
-cp .env.example .env
 npm run dev
 ```
 
 Open the local URL printed by Vite (usually `http://localhost:5173`).
 
-## Environment
-
-```env
-VITE_DETECTION_API_URL=https://delta-o8cc.onrender.com
-```
+No backend API URL is required. Static upload and live camera both detect in the browser.
 
 ## Scripts
 
@@ -26,21 +22,17 @@ VITE_DETECTION_API_URL=https://delta-o8cc.onrender.com
 
 ## Modes
 
-- **Upload Image** — select an aerial image and run a single detection
-- **Live Camera** — stream the device camera and run continuous detection with a single in-flight `/detect` request at a time
+- **Upload Image** — select an aerial image and run single-image detection with the browser WASM ONNX session at imgsz 1280
+- **Live Camera** — stream the device camera and run continuous WebGPU detection at imgsz 960 with max one in-flight inference; busy frames are dropped
 
-Live camera requires HTTPS outside localhost and browser camera permission.
+Live camera requires WebGPU, HTTPS outside localhost, and browser camera permission.
 
 ### Developer diagnostics
 
-Open with `?debug=true` to enable:
+Open with `?debug=onnx` to enable:
 
-- Live Diagnostics panel (latency breakdown, payload size, in-flight count)
-- Capture width / JPEG quality controls
-- Capture-width benchmark
-- Test session recording + quality markers + JSON/CSV export
+- Browser ONNX Caltech regression test
+- Browser runtime benchmark matrix
+- WebGPU camera probe
 
-See `docs/live-camera-evaluation.md`.
-
-**Note:** Capture width is the JPEG uploaded by the browser. Deployed YOLO `imgsz` remains **1280** unless the backend is extended.
-
+Open with `?debug=true` to enable live-camera diagnostics and test-session recording.

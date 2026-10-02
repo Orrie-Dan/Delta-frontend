@@ -1,5 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ApiError, checkHealth, detectPeople } from './api/detection'
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import { ConfidenceFilter } from './components/ConfidenceFilter'
 import { DetectionStats } from './components/DetectionStats'
 import { DetectionViewer } from './components/DetectionViewer'
@@ -9,20 +16,56 @@ import { ImageUploader } from './components/ImageUploader'
 import { LiveCameraPanel } from './components/LiveCameraPanel'
 import { LoadingState } from './components/LoadingState'
 import { ModeSwitcher } from './components/ModeSwitcher'
+import { runBrowserOnnxInferenceFromFile } from './lib/onnxInference'
+import {
+  getOnnxModelSnapshot,
+  initOnnxModel,
+  subscribeOnnxModel,
+  type OnnxModelSnapshot,
+} from './lib/onnxModel'
+import {
+  getWebGpuRuntimeSnapshot,
+  initWebGpuRuntime,
+  subscribeWebGpuRuntime,
+  type WebGpuRuntimeSnapshot,
+} from './lib/onnxWebGpu'
 import type {
-  ApiStatus,
   AppPhase,
   DetectionResponse,
-  HealthResponse,
   WorkspaceMode,
 } from './types/detection'
 import './styles.css'
 
 const DEFAULT_CONFIDENCE = 0.25
 
+const BrowserOnnxTestPanel = lazy(() =>
+  import('./components/BrowserOnnxTestPanel').then((module) => ({
+    default: module.BrowserOnnxTestPanel,
+  })),
+)
+
+const WebGpuCameraDebugPanel = lazy(() =>
+  import('./components/WebGpuCameraDebugPanel').then((module) => ({
+    default: module.WebGpuCameraDebugPanel,
+  })),
+)
+
+/** Debug ONNX / WebGPU panels; enable with ?debug=onnx */
+function useOnnxDebugPanel(): boolean {
+  return useMemo(() => {
+    if (typeof window === 'undefined') return false
+    return new URLSearchParams(window.location.search).get('debug') === 'onnx'
+  }, [])
+}
+
 function App() {
-  const [apiStatus, setApiStatus] = useState<ApiStatus>('checking')
-  const [health, setHealth] = useState<HealthResponse | null>(null)
+  const showOnnxDebugPanel = useOnnxDebugPanel()
+  const [browserModel, setBrowserModel] = useState<OnnxModelSnapshot>(() =>
+    getOnnxModelSnapshot(),
+  )
+  const [webGpu, setWebGpu] = useState<WebGpuRuntimeSnapshot>(() =>
+    getWebGpuRuntimeSnapshot(),
+  )
   const [mode, setMode] = useState<WorkspaceMode>('upload')
   const [phase, setPhase] = useState<AppPhase>('upload')
   const [file, setFile] = useState<File | null>(null)
@@ -34,6 +77,10 @@ function App() {
   const previewUrlRef = useRef<string | null>(null)
   const detectingRef = useRef(false)
 
+  const browserReady = browserModel.status === 'ready'
+  const browserLoading = browserModel.status === 'loading'
+  const browserError = browserModel.status === 'error'
+
   const revokePreview = useCallback(() => {
     if (previewUrlRef.current) {
       URL.revokeObjectURL(previewUrlRef.current)
@@ -41,21 +88,27 @@ function App() {
     }
   }, [])
 
-  const refreshHealth = useCallback(async () => {
-    setApiStatus('checking')
-    try {
-      const response = await checkHealth()
-      setHealth(response)
-      setApiStatus('online')
-    } catch {
-      setHealth(null)
-      setApiStatus('offline')
-    }
+  useEffect(() => {
+    const unsubscribe = subscribeOnnxModel(setBrowserModel)
+    void initOnnxModel().catch(() => {
+      // Status/error are published via subscribeOnnxModel.
+    })
+    return unsubscribe
   }, [])
 
   useEffect(() => {
-    void refreshHealth()
-  }, [refreshHealth])
+    const unsubscribe = subscribeWebGpuRuntime(setWebGpu)
+    // Start WebGPU after the static WASM fetch so each runtime records its own
+    // model load. Live inference still reuses the one WebGPU session.
+    void initOnnxModel()
+      .catch(() => undefined)
+      .finally(() => {
+        void initWebGpuRuntime().catch(() => {
+          // Status/error are published via subscribeWebGpuRuntime.
+        })
+      })
+    return unsubscribe
+  }, [])
 
   useEffect(() => {
     return () => {
@@ -89,29 +142,46 @@ function App() {
 
   const runDetection = useCallback(async () => {
     if (!file || detectingRef.current) return
+    if (!browserReady) {
+      setErrorMessage(
+        browserError
+          ? (browserModel.errorMessage ??
+            'Browser ONNX model failed to load.')
+          : 'Browser ONNX model is still loading. Please wait.',
+      )
+      setPhase('error')
+      return
+    }
 
     detectingRef.current = true
     setPhase('detecting')
     setErrorMessage(null)
 
     try {
-      const response = await detectPeople(file)
+      const { response, timing, diagnostics } =
+        await runBrowserOnnxInferenceFromFile(file)
+
+      console.info('[upload] browser ONNX detection', {
+        people: response.people,
+        detections: response.detections,
+        timing,
+        letterbox: diagnostics.letterbox,
+        sessionIdentity: diagnostics.sessionIdentity,
+      })
+
       setResult(response)
       setPhase('results')
-      if (apiStatus !== 'online') {
-        void refreshHealth()
-      }
     } catch (error) {
       const message =
-        error instanceof ApiError
+        error instanceof Error
           ? error.message
-          : 'An unexpected error occurred during detection.'
+          : 'An unexpected error occurred during browser detection.'
       setErrorMessage(message)
       setPhase('error')
     } finally {
       detectingRef.current = false
     }
-  }, [apiStatus, file, refreshHealth])
+  }, [browserError, browserModel.errorMessage, browserReady, file])
 
   const handleReset = useCallback(() => {
     revokePreview()
@@ -125,30 +195,39 @@ function App() {
 
   return (
     <div className="app-shell">
-      <Header
-        apiStatus={apiStatus}
-        health={health}
-        onRetryHealth={() => void refreshHealth()}
-      />
+      <Header browserModel={browserModel} webGpu={webGpu} />
 
       <main className="app-main">
         <section className="intro">
           <h2 className="intro__title">Detect People in Aerial Imagery</h2>
           <p className="intro__description">
-            Upload a drone or aerial image, or use live camera detection. The AI
-            model identifies people and visualizes their locations.
+            Upload a drone or aerial image, or open the live camera. Both paths
+            run YOLO26s in the browser with no detection server.
           </p>
           <div className="model-badge" aria-label="Model details">
-            YOLO26s • VisDrone • 1280px
+            YOLO26s • VisDrone • Browser ONNX • WebGPU live camera
           </div>
         </section>
 
         <ModeSwitcher mode={mode} onChange={handleModeChange} />
 
+        {showOnnxDebugPanel && (
+          <Suspense
+            fallback={
+              <p className="inline-warning" role="status">
+                Loading browser ONNX debug tools…
+              </p>
+            }
+          >
+            <BrowserOnnxTestPanel browserModel={browserModel} />
+            <WebGpuCameraDebugPanel />
+          </Suspense>
+        )}
+
         {mode === 'live' && (
           <LiveCameraPanel
             active={mode === 'live'}
-            apiStatus={apiStatus}
+            webGpu={webGpu}
             confidenceThreshold={confidenceThreshold}
             onConfidenceChange={setConfidenceThreshold}
           />
@@ -157,6 +236,19 @@ function App() {
         {mode === 'upload' && phase === 'upload' && (
           <section className="panel panel--upload" aria-label="Image upload">
             <ImageUploader onImageSelected={handleImageSelected} />
+            {browserLoading && (
+              <p className="inline-warning" role="status">
+                Loading browser ONNX model… detection will unlock when ready.
+              </p>
+            )}
+            {browserError && (
+              <p className="inline-warning" role="alert">
+                Browser model failed to load
+                {browserModel.errorMessage
+                  ? `: ${browserModel.errorMessage}`
+                  : '.'}
+              </p>
+            )}
           </section>
         )}
 
@@ -176,9 +268,9 @@ function App() {
                   type="button"
                   className="btn btn--primary"
                   onClick={() => void runDetection()}
-                  disabled={apiStatus === 'offline'}
+                  disabled={!browserReady}
                 >
-                  Detect People
+                  {browserLoading ? 'Loading model…' : 'Detect People'}
                 </button>
                 <button
                   type="button"
@@ -189,10 +281,11 @@ function App() {
                 </button>
               </div>
 
-              {apiStatus === 'offline' && (
+              {!browserReady && (
                 <p className="inline-warning" role="status">
-                  Model appears offline. You can still select an image, then
-                  retry when the service is available.
+                  {browserError
+                    ? 'Browser ONNX model is unavailable. Fix model loading before detecting.'
+                    : 'Waiting for the browser ONNX model.'}
                 </p>
               )}
             </div>
@@ -255,6 +348,7 @@ function App() {
                   type="button"
                   className="btn btn--ghost"
                   onClick={() => void runDetection()}
+                  disabled={!browserReady}
                 >
                   Re-run Detection
                 </button>
@@ -271,7 +365,7 @@ function App() {
             <DetectionStats
               result={result}
               filteredDetections={filteredDetections}
-              modelName={health?.model ?? 'YOLO26s'}
+              modelName="YOLO26s (browser ONNX)"
             />
           </section>
         )}
@@ -279,7 +373,7 @@ function App() {
 
       <footer className="app-footer">
         <span>Person Detection MVP</span>
-        <span>YOLO26s · Aerial person detection</span>
+        <span>YOLO26s · Browser ONNX · WebGPU live camera</span>
       </footer>
     </div>
   )

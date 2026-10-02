@@ -1,5 +1,6 @@
 import type { LiveDiagnosticsSnapshot } from '../lib/liveTypes'
-import { DEPLOYED_MODEL_IMGSZ, PERFORMANCE_TARGETS } from '../lib/liveConfig'
+import { PERFORMANCE_TARGETS } from '../lib/liveConfig'
+import { LIVE_WEBGPU_IMGSZ } from '../lib/onnxWebGpu'
 
 interface LiveDiagnosticsProps {
   diagnostics: LiveDiagnosticsSnapshot
@@ -37,10 +38,9 @@ export function LiveDiagnostics({
       {open && (
         <div className="live-diagnostics__panel">
           <p className="live-diagnostics__note">
-            Capture resolution is the JPEG sent to the API. Model inference
-            resolution is currently fixed server-side at{' '}
-            <strong>imgsz={DEPLOYED_MODEL_IMGSZ}</strong> and is not changed by
-            capture width.
+            Live frames stay in the browser. WebGPU inference uses{' '}
+            <strong>imgsz={LIVE_WEBGPU_IMGSZ}</strong> with one inference at a
+            time. Extra camera frames are skipped.
           </p>
 
           <dl className="diag-grid">
@@ -73,15 +73,15 @@ export function LiveDiagnostics({
               <dd>{fmt(diagnostics.encodeMs, 1, ' ms')}</dd>
             </div>
             <div>
-              <dt>API round trip</dt>
+              <dt>Total (preprocess + inference + post)</dt>
               <dd>{fmt(diagnostics.requestTotalMs, 0, ' ms')}</dd>
             </div>
             <div>
-              <dt>Server inference</dt>
+              <dt>Browser inference</dt>
               <dd>{fmt(diagnostics.serverInferenceMs, 0, ' ms')}</dd>
             </div>
             <div>
-              <dt>Non-inference overhead (approx.)</dt>
+              <dt>Preprocess + postprocess</dt>
               <dd>{fmt(diagnostics.nonInferenceOverheadMs, 0, ' ms')}</dd>
             </div>
             <div>
@@ -105,7 +105,7 @@ export function LiveDiagnostics({
               <dd>{diagnostics.confidenceThreshold.toFixed(2)}</dd>
             </div>
             <div>
-              <dt>Requests in flight</dt>
+              <dt>Inferences in flight</dt>
               <dd
                 className={
                   diagnostics.activeRequests > PERFORMANCE_TARGETS.maxInFlight
@@ -114,6 +114,42 @@ export function LiveDiagnostics({
                 }
               >
                 {diagnostics.activeRequests}
+              </dd>
+            </div>
+            <div>
+              <dt>Completed inferences</dt>
+              <dd>{fmtInt(diagnostics.completedInferences)}</dd>
+            </div>
+            <div>
+              <dt>Dropped frames</dt>
+              <dd>{fmtInt(diagnostics.droppedFrames)}</dd>
+            </div>
+            <div>
+              <dt>Latest inference</dt>
+              <dd>{fmt(diagnostics.latestInferenceMs, 0, ' ms')}</dd>
+            </div>
+            <div>
+              <dt>Median inference</dt>
+              <dd>{fmt(diagnostics.medianInferenceMs, 0, ' ms')}</dd>
+            </div>
+            <div>
+              <dt>Median total</dt>
+              <dd>{fmt(diagnostics.medianTotalMs, 0, ' ms')}</dd>
+            </div>
+            <div>
+              <dt>Effective inference FPS</dt>
+              <dd>{fmt(diagnostics.effectiveInferenceFps, 2)}</dd>
+            </div>
+            <div>
+              <dt>Max concurrent inference</dt>
+              <dd
+                className={
+                  diagnostics.maxConcurrentInference > PERFORMANCE_TARGETS.maxInFlight
+                    ? 'diag-bad'
+                    : 'diag-ok'
+                }
+              >
+                {fmtInt(diagnostics.maxConcurrentInference)}
               </dd>
             </div>
             <div>
@@ -126,7 +162,7 @@ export function LiveDiagnostics({
             </div>
             <div>
               <dt>Model imgsz</dt>
-              <dd>{diagnostics.modelImgsz ?? DEPLOYED_MODEL_IMGSZ}</dd>
+              <dd>{diagnostics.modelImgsz ?? LIVE_WEBGPU_IMGSZ}</dd>
             </div>
           </dl>
 

@@ -4,21 +4,17 @@ import { useLiveDetection } from '../hooks/useLiveDetection'
 import {
   DEFAULT_LIVE_CAPTURE_WIDTH,
   DEFAULT_LIVE_JPEG_QUALITY,
-  LIVE_CAPTURE_WIDTHS,
-  LIVE_JPEG_QUALITIES,
-  type LiveCaptureWidth,
-  type LiveJpegQuality,
   type TestScenario,
 } from '../lib/liveConfig'
 import { getObjectFitContainRect } from '../lib/overlayLayout'
-import type { ApiStatus, Detection } from '../types/detection'
+import { LIVE_WEBGPU_IMGSZ, type WebGpuRuntimeSnapshot } from '../lib/onnxWebGpu'
+import type { Detection } from '../types/detection'
 import { ConfidenceFilter } from './ConfidenceFilter'
-import { LiveBenchmark } from './LiveBenchmark'
 import { LiveDiagnostics } from './LiveDiagnostics'
 import { LiveTestSession } from './LiveTestSession'
 
 interface LiveCameraPanelProps {
-  apiStatus: ApiStatus
+  webGpu: WebGpuRuntimeSnapshot
   confidenceThreshold: number
   onConfidenceChange: (value: number) => void
   active: boolean
@@ -35,18 +31,12 @@ function formatFps(fps: number | null): string {
 }
 
 export function LiveCameraPanel({
-  apiStatus,
+  webGpu,
   confidenceThreshold,
   onConfidenceChange,
   active,
 }: LiveCameraPanelProps) {
   const debug = useDebugMode()
-  const [captureWidth, setCaptureWidth] = useState<LiveCaptureWidth>(
-    DEFAULT_LIVE_CAPTURE_WIDTH,
-  )
-  const [jpegQuality, setJpegQuality] = useState<LiveJpegQuality>(
-    DEFAULT_LIVE_JPEG_QUALITY,
-  )
   const [scenario, setScenario] = useState<TestScenario>('single_near')
   const [recording, setRecording] = useState(false)
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(true)
@@ -60,8 +50,8 @@ export function LiveCameraPanel({
 
   const live = useLiveDetection({
     enabled: active,
-    captureWidth,
-    jpegQuality,
+    captureWidth: DEFAULT_LIVE_CAPTURE_WIDTH,
+    jpegQuality: DEFAULT_LIVE_JPEG_QUALITY,
     confidenceThreshold,
     scenario,
     recording,
@@ -82,11 +72,6 @@ export function LiveCameraPanel({
     addQualityMarker,
     clearSessionData,
     exportSession,
-    runCaptureWidthBenchmark,
-    benchmarkRunning,
-    benchmarkProgress,
-    benchmarkSummaries,
-    benchmarkSamples,
     sessionRecords,
     sessionMarkers,
     activeRequests,
@@ -101,6 +86,8 @@ export function LiveCameraPanel({
   const isLive = cameraState === 'active'
   const showOverlay = Boolean(result && isLive && overlayRect.width > 0)
   const canSwitchCamera = videoDevices.length > 1 && isLive
+  const webGpuBlocked = webGpu.status === 'unavailable' || webGpu.status === 'error'
+  const webGpuReady = webGpu.status === 'ready'
 
   const statusHeadline =
     cameraState === 'requesting'
@@ -109,13 +96,15 @@ export function LiveCameraPanel({
         ? 'Camera permission denied'
         : cameraState === 'unavailable'
           ? 'Camera unavailable'
-          : apiStatus === 'offline' && isLive
-            ? 'API unavailable'
-            : isDetecting
-              ? 'Detecting…'
-              : isLive
-                ? 'Camera active'
-                : 'Camera off'
+          : webGpu.status === 'loading'
+            ? 'Preparing WebGPU…'
+            : webGpuBlocked
+              ? 'WebGPU required'
+              : isDetecting
+                ? 'Detecting…'
+                : isLive
+                  ? 'Camera active'
+                  : 'Camera off'
 
   useEffect(() => {
     const video = videoRef.current
@@ -164,39 +153,18 @@ export function LiveCameraPanel({
 
       {debug && (
         <div className="live-debug-controls">
-          <label className="live-field">
-            <span>Capture width (network frame)</span>
-            <select
-              value={captureWidth}
-              onChange={(event) =>
-                setCaptureWidth(Number(event.target.value) as LiveCaptureWidth)
-              }
-            >
-              {LIVE_CAPTURE_WIDTHS.map((width) => (
-                <option key={width} value={width}>
-                  {width}px
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="live-field">
-            <span>JPEG quality</span>
-            <select
-              value={jpegQuality}
-              onChange={(event) =>
-                setJpegQuality(Number(event.target.value) as LiveJpegQuality)
-              }
-            >
-              {LIVE_JPEG_QUALITIES.map((quality) => (
-                <option key={quality} value={quality}>
-                  {quality.toFixed(2)}
-                </option>
-              ))}
-            </select>
-          </label>
           <p className="live-debug__hint">
-            Capture width ≠ YOLO imgsz. Deployed model imgsz remains 1280.
-            In flight: {activeRequests}
+            WebGPU imgsz {LIVE_WEBGPU_IMGSZ}. Frames stay in the browser. In
+            flight: {activeRequests}. Completed: {diagnostics.completedInferences}
+            . Dropped: {diagnostics.droppedFrames}. Latest inference:{' '}
+            {diagnostics.latestInferenceMs == null
+              ? '—'
+              : `${diagnostics.latestInferenceMs.toFixed(0)} ms`}
+            . Effective FPS:{' '}
+            {diagnostics.effectiveInferenceFps == null
+              ? '—'
+              : diagnostics.effectiveInferenceFps.toFixed(2)}
+            . Max concurrent: {diagnostics.maxConcurrentInference}.
           </p>
         </div>
       )}
@@ -281,8 +249,8 @@ export function LiveCameraPanel({
             <div className="live-viewer__placeholder">
               <p className="live-viewer__placeholder-title">Live person detection</p>
               <p className="live-viewer__placeholder-text">
-                Start the camera to capture frames and run YOLO26s detection.
-                The preview stays smooth while inference runs in the background.
+                Start the camera to run YOLO26s on the latest frame in the
+                browser with WebGPU. Busy frames are skipped instead of queued.
               </p>
             </div>
           )}
@@ -299,9 +267,13 @@ export function LiveCameraPanel({
             type="button"
             className="btn btn--primary"
             onClick={() => void startCamera()}
-            disabled={cameraState === 'requesting'}
+            disabled={cameraState === 'requesting' || !webGpuReady}
           >
-            {cameraState === 'requesting' ? 'Starting…' : 'Start Camera'}
+            {cameraState === 'requesting'
+              ? 'Starting…'
+              : webGpu.status === 'loading'
+                ? 'Preparing WebGPU…'
+                : 'Start Camera'}
           </button>
         )}
 
@@ -322,10 +294,10 @@ export function LiveCameraPanel({
         </p>
       )}
 
-      {apiStatus === 'offline' && isLive && (
+      {webGpuBlocked && (
         <p className="inline-warning" role="status">
-          Model API appears offline. Camera preview continues; detection will
-          resume when the service responds.
+          Live detection requires WebGPU on this device/browser.
+          {webGpu.errorMessage ? ` ${webGpu.errorMessage}` : ''}
         </p>
       )}
 
@@ -362,15 +334,6 @@ export function LiveCameraPanel({
               clearSessionData()
             }}
             cameraActive={isLive}
-          />
-
-          <LiveBenchmark
-            running={benchmarkRunning}
-            progress={benchmarkProgress}
-            summaries={benchmarkSummaries}
-            samples={benchmarkSamples}
-            cameraActive={isLive}
-            onRun={() => void runCaptureWidthBenchmark()}
           />
         </div>
       )}
