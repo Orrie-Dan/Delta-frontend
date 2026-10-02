@@ -1,8 +1,7 @@
 import type { DetectionResponse, HealthResponse } from '../types/detection'
 import type { RequestTimingMetrics } from '../lib/liveTypes'
 
-const DEFAULT_API_URL =
-  'https://8000-01m3rpwws2erxk10ype6j42344.cloudspaces.litng.ai'
+const DEFAULT_API_URL = 'https://delta-o8cc.onrender.com'
 
 export const API_BASE_URL =
   (import.meta.env.VITE_DETECTION_API_URL as string | undefined)?.replace(

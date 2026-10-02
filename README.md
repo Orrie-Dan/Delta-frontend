@@ -15,7 +15,7 @@ Open the local URL printed by Vite (usually `http://localhost:5173`).
 ## Environment
 
 ```env
-VITE_DETECTION_API_URL=https://8000-01m3rpwws2erxk10ype6j42344.cloudspaces.litng.ai
+VITE_DETECTION_API_URL=https://delta-o8cc.onrender.com
 ```
 
 ## Scripts
