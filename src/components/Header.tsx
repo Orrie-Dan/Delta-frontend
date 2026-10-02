@@ -1,3 +1,4 @@
+import { isMobileDevice } from '../lib/liveRuntime'
 import type { OnnxModelSnapshot } from '../lib/onnxModel'
 import type { WebGpuRuntimeSnapshot } from '../lib/onnxWebGpu'
 
@@ -6,7 +7,11 @@ interface HeaderProps {
   webGpu: WebGpuRuntimeSnapshot
 }
 
-function webGpuLabel(status: WebGpuRuntimeSnapshot['status']): string {
+function webGpuLabel(
+  status: WebGpuRuntimeSnapshot['status'],
+  mobile: boolean,
+): string {
+  if (mobile && status !== 'ready') return 'WebGPU not used'
   if (status === 'loading') return 'WebGPU loading…'
   if (status === 'ready') return 'WebGPU ready'
   if (status === 'unavailable') return 'WebGPU unavailable'
@@ -14,6 +19,7 @@ function webGpuLabel(status: WebGpuRuntimeSnapshot['status']): string {
 }
 
 export function Header({ browserModel, webGpu }: HeaderProps) {
+  const mobile = isMobileDevice()
   const browserLabel =
     browserModel.status === 'loading'
       ? 'Browser model loading…'
@@ -31,7 +37,10 @@ export function Header({ browserModel, webGpu }: HeaderProps) {
   const webGpuTitle =
     webGpu.status === 'ready'
       ? `Live camera · WebGPU · imgsz 960 · ${webGpu.adapterInfo ?? 'adapter ready'} · session ${webGpu.sessionIdentity}`
-      : (webGpu.errorMessage ?? 'Checking WebGPU live detection')
+      : mobile
+        ? (webGpu.errorMessage ??
+          'Live camera uses cloud CPU on mobile/tablet devices.')
+        : (webGpu.errorMessage ?? 'Checking WebGPU live detection')
 
   return (
     <header className="app-header">
@@ -58,7 +67,7 @@ export function Header({ browserModel, webGpu }: HeaderProps) {
           title={webGpuTitle}
         >
           <span className="status-pill__dot" aria-hidden="true" />
-          <span>{webGpuLabel(webGpu.status)}</span>
+          <span>{webGpuLabel(webGpu.status, mobile)}</span>
         </div>
       </div>
     </header>

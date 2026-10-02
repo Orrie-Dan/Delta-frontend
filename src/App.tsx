@@ -24,8 +24,13 @@ import {
   type OnnxModelSnapshot,
 } from './lib/onnxModel'
 import {
+  isMobileDevice,
+  shouldInitializeWebGpuRuntime,
+} from './lib/liveRuntime'
+import {
   getWebGpuRuntimeSnapshot,
   initWebGpuRuntime,
+  markWebGpuRuntimeSkipped,
   subscribeWebGpuRuntime,
   type WebGpuRuntimeSnapshot,
 } from './lib/onnxWebGpu'
@@ -98,8 +103,18 @@ function App() {
 
   useEffect(() => {
     const unsubscribe = subscribeWebGpuRuntime(setWebGpu)
-    // Start WebGPU after the static WASM fetch so each runtime records its own
-    // model load. Live inference still reuses the one WebGPU session.
+    // Mobile/tablet: never download or create the WebGPU session. Live camera
+    // uses Railway cloud CPU when VITE_DETECTION_API_URL is configured.
+    if (!shouldInitializeWebGpuRuntime()) {
+      markWebGpuRuntimeSkipped(
+        isMobileDevice()
+          ? 'Not used on mobile/tablet — live camera uses cloud CPU fallback.'
+          : 'WebGPU live runtime skipped on this device.',
+      )
+      return unsubscribe
+    }
+    // Desktop: start WebGPU after the static WASM fetch so each runtime
+    // records its own model load. Live inference reuses the one session.
     void initOnnxModel()
       .catch(() => undefined)
       .finally(() => {

@@ -7,6 +7,10 @@ import {
   DEFAULT_LIVE_JPEG_QUALITY,
   type TestScenario,
 } from '../lib/liveConfig'
+import {
+  selectLiveRuntime,
+  selectedRuntimeToLiveLabel,
+} from '../lib/liveRuntime'
 import { getObjectFitContainRect } from '../lib/overlayLayout'
 import { LIVE_WEBGPU_IMGSZ, type WebGpuRuntimeSnapshot } from '../lib/onnxWebGpu'
 import type { Detection } from '../types/detection'
@@ -106,19 +110,26 @@ export function LiveCameraPanel({
   const isLive = cameraState === 'active'
   const showOverlay = Boolean(result && isLive && overlayRect.width > 0)
   const canSwitchCamera = videoDevices.length > 1 && isLive
+  const preferredRuntime = selectLiveRuntime({
+    forceRailway: forceRailwayFallback,
+    webGpuStatus: webGpu.status,
+    webGpuSessionReady:
+      webGpu.status === 'ready' && webGpu.sessionIdentity > 0,
+    cloudConfigured,
+  })
+  const preferredLabel = selectedRuntimeToLiveLabel(preferredRuntime)
   const webGpuReady = webGpu.status === 'ready'
-  const webGpuLoading = webGpu.status === 'loading'
-  const webGpuUnavailable =
-    webGpu.status === 'unavailable' || webGpu.status === 'error'
 
+  // Mobile/forced Railway: Start as soon as cloud URL exists — do not wait on WebGPU.
   const canStartCamera =
     cameraState !== 'requesting' &&
-    (forceRailwayFallback
+    (preferredRuntime === 'railway'
       ? cloudConfigured
-      : webGpuReady || (cloudConfigured && !webGpuLoading))
+      : preferredRuntime === 'webgpu'
+        ? webGpuReady
+        : false)
 
-  const inferenceUnavailable =
-    !webGpuReady && !cloudConfigured && !webGpuLoading
+  const inferenceUnavailable = preferredRuntime === 'unavailable'
 
   const statusHeadline =
     cameraState === 'requesting'
@@ -127,7 +138,7 @@ export function LiveCameraPanel({
         ? 'Camera permission denied'
         : cameraState === 'unavailable'
           ? 'Camera unavailable'
-          : webGpuLoading && !forceRailwayFallback
+          : preferredRuntime === 'pending'
             ? 'Preparing WebGPU…'
             : inferenceUnavailable
               ? 'Live inference unavailable'
@@ -138,15 +149,7 @@ export function LiveCameraPanel({
                   : 'Camera off'
 
   const selectedRuntimeLabel = runtimeLabel(
-    isLive || cameraState === 'requesting'
-      ? liveRuntime
-      : forceRailwayFallback && cloudConfigured
-        ? 'railway'
-        : webGpuReady
-          ? 'webgpu'
-          : cloudConfigured
-            ? 'railway'
-            : 'none',
+    isLive || cameraState === 'requesting' ? liveRuntime : preferredLabel,
   )
 
   useEffect(() => {
@@ -346,11 +349,9 @@ export function LiveCameraPanel({
           >
             {cameraState === 'requesting'
               ? 'Starting…'
-              : webGpuLoading && !forceRailwayFallback && !cloudConfigured
+              : preferredRuntime === 'pending'
                 ? 'Preparing WebGPU…'
-                : webGpuLoading && !forceRailwayFallback
-                  ? 'Preparing WebGPU…'
-                  : 'Start Camera'}
+                : 'Start Camera'}
           </button>
         )}
 
@@ -376,9 +377,6 @@ export function LiveCameraPanel({
           Live inference is unavailable: WebGPU is not supported on this
           device/browser and no cloud fallback URL is configured. Static upload
           still works in the browser.
-          {webGpuUnavailable && webGpu.errorMessage
-            ? ` ${webGpu.errorMessage}`
-            : ''}
         </p>
       )}
 

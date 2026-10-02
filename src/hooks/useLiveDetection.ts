@@ -29,6 +29,11 @@ import type {
   QualityMarkerEvent,
   TestSessionExport,
 } from '../lib/liveTypes'
+import {
+  isForceLiveRailwayFallback,
+  selectLiveRuntime,
+  selectedRuntimeToLiveLabel,
+} from '../lib/liveRuntime'
 import { runIsolatedBrowserInference } from '../lib/onnxInference'
 import {
   LIVE_WEBGPU_IMGSZ,
@@ -36,7 +41,6 @@ import {
   getWebGpuInferenceOptions,
   getWebGpuInferenceSlots,
   getWebGpuModelFetchCount,
-  getWebGpuRuntimeSnapshot,
   getWebGpuSessionCreations,
   tryBeginWebGpuInference,
 } from '../lib/onnxWebGpu'
@@ -54,6 +58,9 @@ const LIVE_UNAVAILABLE_MESSAGE =
   'Live inference is unavailable: WebGPU is not supported and VITE_DETECTION_API_URL is not configured. Static upload still works in the browser.'
 
 export type LiveRuntimeMode = 'webgpu' | 'railway'
+
+// Re-export for LiveCameraPanel / debug callers.
+export { isForceLiveRailwayFallback } from '../lib/liveRuntime'
 
 export interface LiveInferenceDebugStats {
   completed: number
@@ -171,39 +178,13 @@ function averageConfidence(
 }
 
 /**
- * Dev-only force of Railway fallback without changing WebGPU feature detection.
- * Enabled via `forceRailwayFallback` prop, `?forceLiveFallback=1`, or
- * `window.__forceLiveRailwayFallback = true`.
+ * Preferred live runtime using the shared production policy in liveRuntime.ts.
  */
-export function isForceLiveRailwayFallback(
-  propForce?: boolean,
-): boolean {
-  if (propForce) return true
-  if (typeof window === 'undefined') return false
-  const params = new URLSearchParams(window.location.search)
-  if (params.get('forceLiveFallback') === '1') return true
-  return Boolean(
-    (window as Window & { __forceLiveRailwayFallback?: boolean })
-      .__forceLiveRailwayFallback,
-  )
-}
-
 function resolvePreferredRuntime(
   forceRailway: boolean,
 ): LiveRuntimeMode | null {
-  const cloudOk = isDetectionApiConfigured()
-  if (forceRailway) {
-    return cloudOk ? 'railway' : null
-  }
-  const webGpuStatus = getWebGpuRuntimeSnapshot().status
-  if (webGpuStatus === 'ready' && getWebGpuInferenceOptions()) {
-    return 'webgpu'
-  }
-  if (webGpuStatus === 'loading') {
-    // Prefer waiting for WebGPU; caller may still block Start.
-    return null
-  }
-  if (cloudOk) return 'railway'
+  const selected = selectLiveRuntime({ forceRailway })
+  if (selected === 'webgpu' || selected === 'railway') return selected
   return null
 }
 
@@ -307,12 +288,11 @@ export function useLiveDetection({
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [activeRequests, setActiveRequests] = useState(0)
   const [lastRequestId, setLastRequestId] = useState<number | null>(null)
-  const [liveRuntime, setLiveRuntime] = useState<LiveInferenceRuntime>(() => {
-    if (forceRailway && cloudFallbackConfigured) return 'railway'
-    if (getWebGpuRuntimeSnapshot().status === 'ready') return 'webgpu'
-    if (cloudFallbackConfigured) return 'railway'
-    return 'none'
-  })
+  const [liveRuntime, setLiveRuntime] = useState<LiveInferenceRuntime>(() =>
+    selectedRuntimeToLiveLabel(
+      selectLiveRuntime({ forceRailway: forceRailwayFallback }),
+    ),
+  )
   const [liveStats, setLiveStats] = useState<LiveDetectionStats>({
     people: 0,
     inferenceMs: null,
@@ -321,14 +301,9 @@ export function useLiveDetection({
     cameraFps: null,
   })
   const [diagnostics, setDiagnostics] = useState<LiveDiagnosticsSnapshot>(() => {
-    const initialRuntime: LiveInferenceRuntime =
-      forceRailway && cloudFallbackConfigured
-        ? 'railway'
-        : getWebGpuRuntimeSnapshot().status === 'ready'
-          ? 'webgpu'
-          : cloudFallbackConfigured
-            ? 'railway'
-            : 'none'
+    const initialRuntime = selectedRuntimeToLiveLabel(
+      selectLiveRuntime({ forceRailway: forceRailwayFallback }),
+    )
     return emptyDiagnostics(
       confidenceThreshold,
       captureWidth,
@@ -1017,28 +992,23 @@ export function useLiveDetection({
       }
 
       const force = isForceLiveRailwayFallback(forceRailwayRef.current)
-      const webGpuStatus = getWebGpuRuntimeSnapshot().status
-      const cloudOk = isDetectionApiConfigured()
+      const selected = selectLiveRuntime({ forceRailway: force })
 
       let runtime: LiveRuntimeMode | null = null
-      if (force) {
-        if (!cloudOk) {
-          setErrorMessage(
-            'Forced cloud fallback requires VITE_DETECTION_API_URL.',
-          )
-          return
-        }
+      if (selected === 'railway') {
         runtime = 'railway'
-      } else if (webGpuStatus === 'ready' && getWebGpuInferenceOptions()) {
+      } else if (selected === 'webgpu') {
         runtime = 'webgpu'
-      } else if (webGpuStatus === 'loading') {
+      } else if (selected === 'pending') {
         setErrorMessage('WebGPU runtime is still loading.')
         return
-      } else if (cloudOk) {
-        runtime = 'railway'
       } else {
         stopCamera()
-        setErrorMessage(LIVE_UNAVAILABLE_MESSAGE)
+        setErrorMessage(
+          force
+            ? 'Forced cloud fallback requires VITE_DETECTION_API_URL.'
+            : LIVE_UNAVAILABLE_MESSAGE,
+        )
         return
       }
 

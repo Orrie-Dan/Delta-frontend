@@ -195,6 +195,24 @@ export function getWebGpuInferenceSlots(): number {
   return webGpuInferenceSlots
 }
 
+/**
+ * Mark WebGPU as intentionally unused without creating a session.
+ * Used on mobile/tablet so production never downloads/initializes WebGPU.
+ * Does not increment sessionCreations or modelFetchCount.
+ */
+export function markWebGpuRuntimeSkipped(reason: string): WebGpuRuntimeSnapshot {
+  if (runtime && status === 'ready') {
+    return getSnapshot()
+  }
+  runtime = null
+  status = 'unavailable'
+  errorMessage = reason
+  adapterInfo = null
+  initPromise = null
+  notify()
+  return getSnapshot()
+}
+
 function failInit(
   nextStatus: 'unavailable' | 'error',
   reason: string,
