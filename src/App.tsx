@@ -201,8 +201,9 @@ function App() {
         <section className="intro">
           <h2 className="intro__title">Detect People in Aerial Imagery</h2>
           <p className="intro__description">
-            Upload a drone or aerial image, or open the live camera. Both paths
-            run YOLO26s in the browser with no detection server.
+            Upload a drone or aerial image for browser WASM detection, or open
+            the live camera for WebGPU (or cloud CPU fallback when WebGPU is
+            unavailable).
           </p>
           <div className="model-badge" aria-label="Model details">
             YOLO26s • VisDrone • Browser ONNX • WebGPU live camera

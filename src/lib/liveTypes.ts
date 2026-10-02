@@ -1,9 +1,21 @@
 import type {
   LiveCaptureWidth,
+  LiveInferenceRuntime,
   LiveJpegQuality,
   QualityMarkerType,
   TestScenario,
 } from './liveConfig'
+
+export interface FrameCaptureMetrics {
+  blob: Blob
+  sourceWidth: number
+  sourceHeight: number
+  captureWidth: number
+  captureHeight: number
+  captureMs: number
+  encodeMs: number
+  payloadBytes: number
+}
 
 export interface LiveFrameMetrics {
   requestId: number
@@ -33,6 +45,7 @@ export interface LiveFrameMetrics {
 }
 
 export interface LiveDiagnosticsSnapshot {
+  runtime: LiveInferenceRuntime
   cameraWidth: number | null
   cameraHeight: number | null
   captureWidth: number | null
@@ -59,6 +72,11 @@ export interface LiveDiagnosticsSnapshot {
   medianTotalMs: number | null
   effectiveInferenceFps: number | null
   maxConcurrentInference: number
+  /** Railway-only counters (0 when runtime is WebGPU). */
+  railwayRequestsStarted: number
+  railwayRequestsCompleted: number
+  railwayRequestsFailed: number
+  clientRoundTripMs: number | null
 }
 
 export interface QualityMarkerEvent {

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useDebugMode } from '../hooks/useDebugMode'
 import { useLiveDetection } from '../hooks/useLiveDetection'
+import { isDetectionApiConfigured } from '../lib/detectionApiConfig'
 import {
   DEFAULT_LIVE_CAPTURE_WIDTH,
   DEFAULT_LIVE_JPEG_QUALITY,
@@ -30,6 +31,14 @@ function formatFps(fps: number | null): string {
   return `${fps.toFixed(2)}`
 }
 
+function runtimeLabel(
+  runtime: 'webgpu' | 'railway' | 'none',
+): string | null {
+  if (runtime === 'webgpu') return 'Live inference: WebGPU'
+  if (runtime === 'railway') return 'Live inference: Cloud CPU'
+  return null
+}
+
 export function LiveCameraPanel({
   webGpu,
   confidenceThreshold,
@@ -40,6 +49,13 @@ export function LiveCameraPanel({
   const [scenario, setScenario] = useState<TestScenario>('single_near')
   const [recording, setRecording] = useState(false)
   const [diagnosticsOpen, setDiagnosticsOpen] = useState(true)
+  const [forceRailwayFallback, setForceRailwayFallback] = useState(() => {
+    if (typeof window === 'undefined') return false
+    return (
+      new URLSearchParams(window.location.search).get('forceLiveFallback') ===
+      '1'
+    )
+  })
   const [overlayRect, setOverlayRect] = useState({
     x: 0,
     y: 0,
@@ -48,6 +64,8 @@ export function LiveCameraPanel({
   })
   const [videoIntrinsic, setVideoIntrinsic] = useState({ w: 0, h: 0 })
 
+  const cloudConfigured = isDetectionApiConfigured()
+
   const live = useLiveDetection({
     enabled: active,
     captureWidth: DEFAULT_LIVE_CAPTURE_WIDTH,
@@ -55,6 +73,7 @@ export function LiveCameraPanel({
     confidenceThreshold,
     scenario,
     recording,
+    forceRailwayFallback,
   })
 
   const {
@@ -75,6 +94,7 @@ export function LiveCameraPanel({
     sessionRecords,
     sessionMarkers,
     activeRequests,
+    liveRuntime,
   } = live
 
   const filteredDetections = useMemo(() => {
@@ -86,8 +106,19 @@ export function LiveCameraPanel({
   const isLive = cameraState === 'active'
   const showOverlay = Boolean(result && isLive && overlayRect.width > 0)
   const canSwitchCamera = videoDevices.length > 1 && isLive
-  const webGpuBlocked = webGpu.status === 'unavailable' || webGpu.status === 'error'
   const webGpuReady = webGpu.status === 'ready'
+  const webGpuLoading = webGpu.status === 'loading'
+  const webGpuUnavailable =
+    webGpu.status === 'unavailable' || webGpu.status === 'error'
+
+  const canStartCamera =
+    cameraState !== 'requesting' &&
+    (forceRailwayFallback
+      ? cloudConfigured
+      : webGpuReady || (cloudConfigured && !webGpuLoading))
+
+  const inferenceUnavailable =
+    !webGpuReady && !cloudConfigured && !webGpuLoading
 
   const statusHeadline =
     cameraState === 'requesting'
@@ -96,15 +127,27 @@ export function LiveCameraPanel({
         ? 'Camera permission denied'
         : cameraState === 'unavailable'
           ? 'Camera unavailable'
-          : webGpu.status === 'loading'
+          : webGpuLoading && !forceRailwayFallback
             ? 'Preparing WebGPU…'
-            : webGpuBlocked
-              ? 'WebGPU required'
+            : inferenceUnavailable
+              ? 'Live inference unavailable'
               : isDetecting
                 ? 'Detecting…'
                 : isLive
                   ? 'Camera active'
                   : 'Camera off'
+
+  const selectedRuntimeLabel = runtimeLabel(
+    isLive || cameraState === 'requesting'
+      ? liveRuntime
+      : forceRailwayFallback && cloudConfigured
+        ? 'railway'
+        : webGpuReady
+          ? 'webgpu'
+          : cloudConfigured
+            ? 'railway'
+            : 'none',
+  )
 
   useEffect(() => {
     const video = videoRef.current
@@ -151,15 +194,46 @@ export function LiveCameraPanel({
         />
       </div>
 
+      {selectedRuntimeLabel && (
+        <p className="live-runtime-label" role="status">
+          {selectedRuntimeLabel}
+        </p>
+      )}
+
+      {liveRuntime === 'railway' && isLive && (
+        <p className="live-privacy-note" role="note">
+          Cloud fallback sends sampled camera frames for detection.
+        </p>
+      )}
+
       {debug && (
         <div className="live-debug-controls">
+          <label className="live-debug__force">
+            <input
+              type="checkbox"
+              checked={forceRailwayFallback}
+              disabled={isLive || !cloudConfigured}
+              onChange={(event) =>
+                setForceRailwayFallback(event.target.checked)
+              }
+            />
+            Force cloud CPU fallback
+          </label>
           <p className="live-debug__hint">
-            WebGPU imgsz {LIVE_WEBGPU_IMGSZ}. Frames stay in the browser. In
-            flight: {activeRequests}. Completed: {diagnostics.completedInferences}
-            . Dropped: {diagnostics.droppedFrames}. Latest inference:{' '}
+            Runtime: {liveRuntime}. WebGPU imgsz {LIVE_WEBGPU_IMGSZ}; Railway
+            imgsz 1280. In flight: {activeRequests}. Completed:{' '}
+            {diagnostics.completedInferences}. Dropped:{' '}
+            {diagnostics.droppedFrames}. Railway started/completed/failed:{' '}
+            {diagnostics.railwayRequestsStarted}/
+            {diagnostics.railwayRequestsCompleted}/
+            {diagnostics.railwayRequestsFailed}. Latest inference:{' '}
             {diagnostics.latestInferenceMs == null
               ? '—'
               : `${diagnostics.latestInferenceMs.toFixed(0)} ms`}
+            . Round-trip:{' '}
+            {diagnostics.clientRoundTripMs == null
+              ? '—'
+              : `${diagnostics.clientRoundTripMs.toFixed(0)} ms`}
             . Effective FPS:{' '}
             {diagnostics.effectiveInferenceFps == null
               ? '—'
@@ -249,8 +323,9 @@ export function LiveCameraPanel({
             <div className="live-viewer__placeholder">
               <p className="live-viewer__placeholder-title">Live person detection</p>
               <p className="live-viewer__placeholder-text">
-                Start the camera to run YOLO26s on the latest frame in the
-                browser with WebGPU. Busy frames are skipped instead of queued.
+                Start the camera to run YOLO26s on the latest frame. WebGPU is
+                preferred; devices without WebGPU use cloud CPU fallback. Busy
+                frames are skipped instead of queued.
               </p>
             </div>
           )}
@@ -267,13 +342,15 @@ export function LiveCameraPanel({
             type="button"
             className="btn btn--primary"
             onClick={() => void startCamera()}
-            disabled={cameraState === 'requesting' || !webGpuReady}
+            disabled={!canStartCamera}
           >
             {cameraState === 'requesting'
               ? 'Starting…'
-              : webGpu.status === 'loading'
+              : webGpuLoading && !forceRailwayFallback && !cloudConfigured
                 ? 'Preparing WebGPU…'
-                : 'Start Camera'}
+                : webGpuLoading && !forceRailwayFallback
+                  ? 'Preparing WebGPU…'
+                  : 'Start Camera'}
           </button>
         )}
 
@@ -294,10 +371,14 @@ export function LiveCameraPanel({
         </p>
       )}
 
-      {webGpuBlocked && (
+      {inferenceUnavailable && (
         <p className="inline-warning" role="status">
-          Live detection requires WebGPU on this device/browser.
-          {webGpu.errorMessage ? ` ${webGpu.errorMessage}` : ''}
+          Live inference is unavailable: WebGPU is not supported on this
+          device/browser and no cloud fallback URL is configured. Static upload
+          still works in the browser.
+          {webGpuUnavailable && webGpu.errorMessage
+            ? ` ${webGpu.errorMessage}`
+            : ''}
         </p>
       )}
 

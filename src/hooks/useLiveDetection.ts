@@ -6,10 +6,19 @@ import {
   type RefObject,
 } from 'react'
 import {
+  detectPeopleOnRailway,
+  RailwayDetectionError,
+} from '../api/railwayDetection'
+import { captureVideoFrame } from '../lib/captureFrame'
+import { isDetectionApiConfigured } from '../lib/detectionApiConfig'
+import {
   DEFAULT_LIVE_CAPTURE_WIDTH,
   DEFAULT_LIVE_JPEG_QUALITY,
   DETECTION_FPS_WINDOW_MS,
+  RAILWAY_ERROR_COOLDOWN_MS,
+  RAILWAY_MODEL_IMGSZ,
   type LiveCaptureWidth,
+  type LiveInferenceRuntime,
   type LiveJpegQuality,
   type QualityMarkerType,
   type TestScenario,
@@ -39,7 +48,12 @@ import type {
 } from '../types/detection'
 
 const WEBGPU_REQUIRED_MESSAGE =
-  'Live detection requires WebGPU on this device/browser.'
+  'Live detection requires WebGPU on this device/browser, or a configured cloud fallback URL.'
+
+const LIVE_UNAVAILABLE_MESSAGE =
+  'Live inference is unavailable: WebGPU is not supported and VITE_DETECTION_API_URL is not configured. Static upload still works in the browser.'
+
+export type LiveRuntimeMode = 'webgpu' | 'railway'
 
 export interface LiveInferenceDebugStats {
   completed: number
@@ -54,10 +68,13 @@ export interface LiveInferenceDebugStats {
   activeInFlight: number
   sessionIdentity: number | null
   modelImgsz: number
-  executionProvider: 'webgpu'
+  executionProvider: 'webgpu' | 'railway'
   sessionStartedAtMs: number | null
   modelFetchCount: number
   sessionCreations: number
+  railwayRequestsStarted: number
+  railwayRequestsCompleted: number
+  railwayRequestsFailed: number
 }
 
 interface UseLiveDetectionOptions {
@@ -67,6 +84,8 @@ interface UseLiveDetectionOptions {
   confidenceThreshold: number
   scenario: TestScenario
   recording: boolean
+  /** Dev/debug: force Railway path even when WebGPU is ready. */
+  forceRailwayFallback?: boolean
 }
 
 interface UseLiveDetectionResult {
@@ -83,6 +102,9 @@ interface UseLiveDetectionResult {
   lastRequestId: number | null
   sessionRecords: LiveFrameMetrics[]
   sessionMarkers: QualityMarkerEvent[]
+  /** Selected live inference runtime for the active session (or preferred). */
+  liveRuntime: LiveInferenceRuntime
+  cloudFallbackConfigured: boolean
   startCamera: (deviceId?: string) => Promise<void>
   stopCamera: () => void
   switchCamera: () => Promise<void>
@@ -148,6 +170,85 @@ function averageConfidence(
   )
 }
 
+/**
+ * Dev-only force of Railway fallback without changing WebGPU feature detection.
+ * Enabled via `forceRailwayFallback` prop, `?forceLiveFallback=1`, or
+ * `window.__forceLiveRailwayFallback = true`.
+ */
+export function isForceLiveRailwayFallback(
+  propForce?: boolean,
+): boolean {
+  if (propForce) return true
+  if (typeof window === 'undefined') return false
+  const params = new URLSearchParams(window.location.search)
+  if (params.get('forceLiveFallback') === '1') return true
+  return Boolean(
+    (window as Window & { __forceLiveRailwayFallback?: boolean })
+      .__forceLiveRailwayFallback,
+  )
+}
+
+function resolvePreferredRuntime(
+  forceRailway: boolean,
+): LiveRuntimeMode | null {
+  const cloudOk = isDetectionApiConfigured()
+  if (forceRailway) {
+    return cloudOk ? 'railway' : null
+  }
+  const webGpuStatus = getWebGpuRuntimeSnapshot().status
+  if (webGpuStatus === 'ready' && getWebGpuInferenceOptions()) {
+    return 'webgpu'
+  }
+  if (webGpuStatus === 'loading') {
+    // Prefer waiting for WebGPU; caller may still block Start.
+    return null
+  }
+  if (cloudOk) return 'railway'
+  return null
+}
+
+function emptyDiagnostics(
+  confidenceThreshold: number,
+  captureWidth: LiveCaptureWidth,
+  jpegQuality: LiveJpegQuality,
+  runtime: LiveInferenceRuntime = 'none',
+): LiveDiagnosticsSnapshot {
+  return {
+    runtime,
+    cameraWidth: null,
+    cameraHeight: null,
+    captureWidth: null,
+    captureHeight: null,
+    payloadKb: null,
+    captureMs: null,
+    encodeMs: null,
+    requestTotalMs: null,
+    serverInferenceMs: null,
+    nonInferenceOverheadMs: null,
+    detectionFps: null,
+    cameraFps: null,
+    visibleDetections: 0,
+    returnedDetections: 0,
+    confidenceThreshold,
+    activeRequests: 0,
+    currentCaptureWidthSetting: captureWidth,
+    currentJpegQuality: jpegQuality,
+    modelImgsz:
+      runtime === 'railway' ? RAILWAY_MODEL_IMGSZ : LIVE_WEBGPU_IMGSZ,
+    completedInferences: 0,
+    droppedFrames: 0,
+    latestInferenceMs: null,
+    medianInferenceMs: null,
+    medianTotalMs: null,
+    effectiveInferenceFps: null,
+    maxConcurrentInference: 0,
+    railwayRequestsStarted: 0,
+    railwayRequestsCompleted: 0,
+    railwayRequestsFailed: 0,
+    clientRoundTripMs: null,
+  }
+}
+
 export function useLiveDetection({
   enabled,
   captureWidth,
@@ -155,9 +256,11 @@ export function useLiveDetection({
   confidenceThreshold,
   scenario,
   recording,
+  forceRailwayFallback = false,
 }: UseLiveDetectionOptions): UseLiveDetectionResult {
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const runningRef = useRef(false)
   const inFlightRef = useRef(false)
   const activeRequestsRef = useRef(0)
@@ -178,17 +281,25 @@ export function useLiveDetection({
   const latestTotalMsRef = useRef<number | null>(null)
   const sessionIdentityRef = useRef<number | null>(null)
   const lastDropUiRef = useRef(0)
-  const webGpuBlockedRef = useRef(false)
+  const runtimeRef = useRef<LiveRuntimeMode | null>(null)
+  const railwayStartedRef = useRef(0)
+  const railwayCompletedRef = useRef(0)
+  const railwayFailedRef = useRef(0)
+  const railwayCooldownUntilRef = useRef(0)
   const captureWidthRef = useRef(captureWidth)
   const jpegQualityRef = useRef(jpegQuality)
   const confidenceRef = useRef(confidenceThreshold)
   const recordingRef = useRef(recording)
   const scenarioRef = useRef(scenario)
+  const forceRailwayRef = useRef(forceRailwayFallback)
   const cameraFpsRef = useRef<number | null>(null)
   const pauseLoopRef = useRef(false)
   const rafRef = useRef<number | null>(null)
   const cameraFrameCountRef = useRef(0)
   const cameraFpsWindowStartRef = useRef(0)
+
+  const cloudFallbackConfigured = isDetectionApiConfigured()
+  const forceRailway = isForceLiveRailwayFallback(forceRailwayFallback)
 
   const [cameraState, setCameraState] = useState<CameraLifecycle>('off')
   const [isDetecting, setIsDetecting] = useState(false)
@@ -196,6 +307,12 @@ export function useLiveDetection({
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [activeRequests, setActiveRequests] = useState(0)
   const [lastRequestId, setLastRequestId] = useState<number | null>(null)
+  const [liveRuntime, setLiveRuntime] = useState<LiveInferenceRuntime>(() => {
+    if (forceRailway && cloudFallbackConfigured) return 'railway'
+    if (getWebGpuRuntimeSnapshot().status === 'ready') return 'webgpu'
+    if (cloudFallbackConfigured) return 'railway'
+    return 'none'
+  })
   const [liveStats, setLiveStats] = useState<LiveDetectionStats>({
     people: 0,
     inferenceMs: null,
@@ -203,33 +320,21 @@ export function useLiveDetection({
     detectionFps: null,
     cameraFps: null,
   })
-  const [diagnostics, setDiagnostics] = useState<LiveDiagnosticsSnapshot>({
-    cameraWidth: null,
-    cameraHeight: null,
-    captureWidth: null,
-    captureHeight: null,
-    payloadKb: null,
-    captureMs: null,
-    encodeMs: null,
-    requestTotalMs: null,
-    serverInferenceMs: null,
-    nonInferenceOverheadMs: null,
-    detectionFps: null,
-    cameraFps: null,
-    visibleDetections: 0,
-    returnedDetections: 0,
-    confidenceThreshold,
-    activeRequests: 0,
-    currentCaptureWidthSetting: captureWidth,
-    currentJpegQuality: jpegQuality,
-    modelImgsz: LIVE_WEBGPU_IMGSZ,
-    completedInferences: 0,
-    droppedFrames: 0,
-    latestInferenceMs: null,
-    medianInferenceMs: null,
-    medianTotalMs: null,
-    effectiveInferenceFps: null,
-    maxConcurrentInference: 0,
+  const [diagnostics, setDiagnostics] = useState<LiveDiagnosticsSnapshot>(() => {
+    const initialRuntime: LiveInferenceRuntime =
+      forceRailway && cloudFallbackConfigured
+        ? 'railway'
+        : getWebGpuRuntimeSnapshot().status === 'ready'
+          ? 'webgpu'
+          : cloudFallbackConfigured
+            ? 'railway'
+            : 'none'
+    return emptyDiagnostics(
+      confidenceThreshold,
+      captureWidth,
+      jpegQuality,
+      initialRuntime,
+    )
   })
   const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([])
   const [activeDeviceId, setActiveDeviceId] = useState<string | null>(null)
@@ -243,22 +348,47 @@ export function useLiveDetection({
     confidenceRef.current = confidenceThreshold
     recordingRef.current = recording
     scenarioRef.current = scenario
+    forceRailwayRef.current = forceRailwayFallback
     setDiagnostics((prev) => ({
       ...prev,
       confidenceThreshold,
       currentCaptureWidthSetting: captureWidth,
       currentJpegQuality: jpegQuality,
     }))
-  }, [captureWidth, jpegQuality, confidenceThreshold, recording, scenario])
+  }, [
+    captureWidth,
+    jpegQuality,
+    confidenceThreshold,
+    recording,
+    scenario,
+    forceRailwayFallback,
+  ])
 
   useEffect(() => {
     if (recording && !sessionStartedAtRef.current) {
       sessionStartedAtRef.current = new Date().toISOString()
     }
-    if (!recording) {
-      // keep startedAt until export/clear
-    }
   }, [recording])
+
+  // Keep preferred runtime label updated while camera is off.
+  useEffect(() => {
+    if (cameraState === 'active' || cameraState === 'requesting') return
+    const preferred = resolvePreferredRuntime(
+      isForceLiveRailwayFallback(forceRailwayFallback),
+    )
+    if (preferred) {
+      setLiveRuntime(preferred)
+      setDiagnostics((prev) => ({
+        ...prev,
+        runtime: preferred,
+        modelImgsz:
+          preferred === 'railway' ? RAILWAY_MODEL_IMGSZ : LIVE_WEBGPU_IMGSZ,
+      }))
+    } else {
+      setLiveRuntime('none')
+      setDiagnostics((prev) => ({ ...prev, runtime: 'none' }))
+    }
+  }, [cameraState, forceRailwayFallback, cloudFallbackConfigured, forceRailway])
 
   const clearLoopTimer = useCallback(() => {
     if (loopTimerRef.current !== null) {
@@ -347,7 +477,11 @@ export function useLiveDetection({
     latestInferenceMsRef.current = null
     latestTotalMsRef.current = null
     sessionIdentityRef.current = null
-    webGpuBlockedRef.current = false
+    runtimeRef.current = null
+    railwayStartedRef.current = 0
+    railwayCompletedRef.current = 0
+    railwayFailedRef.current = 0
+    railwayCooldownUntilRef.current = 0
     stopCameraFpsMonitor()
     stopTracks()
     setIsDetecting(false)
@@ -362,32 +496,18 @@ export function useLiveDetection({
       detectionFps: null,
       cameraFps: null,
     })
-    setDiagnostics((prev) => ({
-      ...prev,
-      cameraWidth: null,
-      cameraHeight: null,
-      captureWidth: null,
-      captureHeight: null,
-      payloadKb: null,
-      captureMs: null,
-      encodeMs: null,
-      requestTotalMs: null,
-      serverInferenceMs: null,
-      nonInferenceOverheadMs: null,
-      detectionFps: null,
-      cameraFps: null,
-      visibleDetections: 0,
-      returnedDetections: 0,
-      activeRequests: 0,
-      completedInferences: 0,
-      droppedFrames: 0,
-      latestInferenceMs: null,
-      medianInferenceMs: null,
-      medianTotalMs: null,
-      effectiveInferenceFps: null,
-      maxConcurrentInference: 0,
-      modelImgsz: LIVE_WEBGPU_IMGSZ,
-    }))
+    const preferred = resolvePreferredRuntime(
+      isForceLiveRailwayFallback(forceRailwayRef.current),
+    )
+    setLiveRuntime(preferred ?? 'none')
+    setDiagnostics(
+      emptyDiagnostics(
+        confidenceRef.current,
+        captureWidthRef.current,
+        jpegQualityRef.current,
+        preferred ?? 'none',
+      ),
+    )
     setCameraState('off')
     setActiveDeviceId(null)
   }, [setInFlight, stopCameraFpsMonitor, stopDetectionLoop, stopTracks])
@@ -411,6 +531,7 @@ export function useLiveDetection({
       started == null ? 0 : Math.max(0, (performance.now() - started) / 1000)
     const inferenceSamples = inferenceSamplesRef.current
     const totalSamples = totalSamplesRef.current
+    const runtime = runtimeRef.current ?? 'webgpu'
     const stats: LiveInferenceDebugStats = {
       completed: completedRef.current,
       dropped: droppedRef.current,
@@ -423,13 +544,20 @@ export function useLiveDetection({
       effectiveFps:
         elapsedSec > 0 ? completedRef.current / elapsedSec : null,
       maxConcurrentInference: maxConcurrentRef.current,
-      activeInFlight: getWebGpuInferenceSlots(),
+      activeInFlight:
+        runtime === 'webgpu'
+          ? getWebGpuInferenceSlots()
+          : activeRequestsRef.current,
       sessionIdentity: sessionIdentityRef.current,
-      modelImgsz: LIVE_WEBGPU_IMGSZ,
-      executionProvider: 'webgpu',
+      modelImgsz:
+        runtime === 'railway' ? RAILWAY_MODEL_IMGSZ : LIVE_WEBGPU_IMGSZ,
+      executionProvider: runtime,
       sessionStartedAtMs: started,
       modelFetchCount: getWebGpuModelFetchCount(),
       sessionCreations: getWebGpuSessionCreations(),
+      railwayRequestsStarted: railwayStartedRef.current,
+      railwayRequestsCompleted: railwayCompletedRef.current,
+      railwayRequestsFailed: railwayFailedRef.current,
     }
     ;(
       window as Window & { __liveInferenceStats?: LiveInferenceDebugStats }
@@ -437,8 +565,34 @@ export function useLiveDetection({
     return stats
   }, [])
 
+  const noteDroppedFrame = useCallback(() => {
+    droppedRef.current += 1
+    if (import.meta.env.DEV) {
+      const liveStats = (
+        window as Window & { __liveInferenceStats?: LiveInferenceDebugStats }
+      ).__liveInferenceStats
+      if (liveStats) liveStats.dropped = droppedRef.current
+    }
+    const now = performance.now()
+    if (now - lastDropUiRef.current >= 500) {
+      lastDropUiRef.current = now
+      const stats = publishDebugStats()
+      setDiagnostics((prev) => ({
+        ...prev,
+        droppedFrames: stats.dropped,
+        completedInferences: stats.completed,
+        effectiveInferenceFps: stats.effectiveFps,
+        maxConcurrentInference: stats.maxConcurrentInference,
+        activeRequests: inFlightRef.current ? 1 : 0,
+        railwayRequestsStarted: railwayStartedRef.current,
+        railwayRequestsCompleted: railwayCompletedRef.current,
+        railwayRequestsFailed: railwayFailedRef.current,
+      }))
+    }
+  }, [publishDebugStats])
+
   const runDetectionLoop = useCallback(
-    (sessionId: number) => {
+    (sessionId: number, runtime: LiveRuntimeMode) => {
       const schedule = () => {
         detectionRafRef.current = requestAnimationFrame(tick)
       }
@@ -459,36 +613,230 @@ export function useLiveDetection({
 
         schedule()
 
-        const runtime = getWebGpuInferenceOptions()
-        if (!runtime) {
-          if (!webGpuBlockedRef.current) {
-            webGpuBlockedRef.current = true
-            setErrorMessage(WEBGPU_REQUIRED_MESSAGE)
+        if (runtime === 'railway') {
+          if (performance.now() < railwayCooldownUntilRef.current) {
+            return
           }
+          if (inFlightRef.current) {
+            noteDroppedFrame()
+            return
+          }
+
+          inFlightRef.current = true
+          activeRequestsRef.current = 1
+          maxConcurrentRef.current = Math.max(maxConcurrentRef.current, 1)
+          setInFlight(true)
+          setIsDetecting(true)
+          const requestId = ++requestSeqRef.current
+          const abortController = new AbortController()
+          abortRef.current = abortController
+          railwayStartedRef.current += 1
+
+          void (async () => {
+            try {
+              if (!canvasRef.current) {
+                canvasRef.current = document.createElement('canvas')
+              }
+
+              const capture = await captureVideoFrame(
+                video,
+                canvasRef.current,
+                {
+                  captureWidth: captureWidthRef.current,
+                  jpegQuality: jpegQualityRef.current,
+                },
+              )
+
+              if (!runningRef.current || sessionId !== sessionIdRef.current) {
+                return
+              }
+
+              const { response, timing } = await detectPeopleOnRailway(
+                capture.blob,
+                {
+                  filename: 'frame.jpg',
+                  signal: abortController.signal,
+                },
+              )
+
+              if (!runningRef.current || sessionId !== sessionIdRef.current) {
+                return
+              }
+              if (requestId < appliedSeqRef.current) return
+
+              appliedSeqRef.current = requestId
+              completedRef.current += 1
+              railwayCompletedRef.current += 1
+              latestInferenceMsRef.current = timing.serverInferenceMs
+              latestTotalMsRef.current = timing.requestTotalMs
+              inferenceSamplesRef.current.push(timing.serverInferenceMs)
+              totalSamplesRef.current.push(timing.requestTotalMs)
+              const debugStats = publishDebugStats()
+
+              setLastRequestId(requestId)
+              setResult(response)
+              setErrorMessage(null)
+
+              const now = performance.now()
+              completionTimestampsRef.current.push(now)
+              completionTimestampsRef.current =
+                completionTimestampsRef.current.filter(
+                  (ts) => now - ts <= DETECTION_FPS_WINDOW_MS,
+                )
+              const detectionFps = computeDetectionFps(
+                completionTimestampsRef.current,
+                now,
+              )
+              const visible = response.detections.filter(
+                (d) => d.confidence >= confidenceRef.current,
+              ).length
+              const avgConf = averageConfidence(response.detections)
+              const modelImgsz =
+                response.model_imgsz ??
+                timing.modelImgsz ??
+                RAILWAY_MODEL_IMGSZ
+
+              setLiveStats({
+                people: response.people,
+                inferenceMs: timing.serverInferenceMs,
+                requestTotalMs: timing.requestTotalMs,
+                detectionFps,
+                cameraFps: cameraFpsRef.current,
+              })
+
+              const metrics: LiveFrameMetrics = {
+                requestId,
+                sessionId,
+                timestamp: new Date().toISOString(),
+                sourceWidth: capture.sourceWidth,
+                sourceHeight: capture.sourceHeight,
+                captureWidth: capture.captureWidth,
+                captureHeight: capture.captureHeight,
+                jpegQuality: jpegQualityRef.current,
+                payloadBytes: capture.payloadBytes,
+                payloadKb: capture.payloadBytes / 1024,
+                captureMs: capture.captureMs,
+                encodeMs: capture.encodeMs,
+                requestTotalMs: timing.requestTotalMs,
+                serverInferenceMs: timing.serverInferenceMs,
+                nonInferenceOverheadMs: timing.nonInferenceOverheadMs,
+                parseMs: timing.parseMs,
+                peopleReturned: response.people,
+                visibleDetections: visible,
+                averageConfidence: avgConf,
+                modelImgsz,
+                detectionFps,
+                cameraFps: cameraFpsRef.current,
+                activeRequests: 1,
+                confidenceThreshold: confidenceRef.current,
+              }
+
+              setDiagnostics({
+                runtime: 'railway',
+                cameraWidth: capture.sourceWidth,
+                cameraHeight: capture.sourceHeight,
+                captureWidth: capture.captureWidth,
+                captureHeight: capture.captureHeight,
+                payloadKb: capture.payloadBytes / 1024,
+                captureMs: capture.captureMs,
+                encodeMs: capture.encodeMs,
+                requestTotalMs: timing.requestTotalMs,
+                serverInferenceMs: timing.serverInferenceMs,
+                nonInferenceOverheadMs: timing.nonInferenceOverheadMs,
+                detectionFps,
+                cameraFps: cameraFpsRef.current,
+                visibleDetections: visible,
+                returnedDetections: response.people,
+                confidenceThreshold: confidenceRef.current,
+                activeRequests: 1,
+                currentCaptureWidthSetting: captureWidthRef.current,
+                currentJpegQuality: jpegQualityRef.current,
+                modelImgsz,
+                completedInferences: debugStats.completed,
+                droppedFrames: debugStats.dropped,
+                latestInferenceMs: debugStats.latestInferenceMs,
+                medianInferenceMs: debugStats.medianInferenceMs,
+                medianTotalMs: debugStats.medianTotalMs,
+                effectiveInferenceFps: debugStats.effectiveFps,
+                maxConcurrentInference: debugStats.maxConcurrentInference,
+                railwayRequestsStarted: railwayStartedRef.current,
+                railwayRequestsCompleted: railwayCompletedRef.current,
+                railwayRequestsFailed: railwayFailedRef.current,
+                clientRoundTripMs: timing.requestTotalMs,
+              })
+
+              if (recordingRef.current) {
+                setSessionRecords((prev) => [...prev, metrics])
+              }
+
+              if (import.meta.env.DEV) {
+                console.debug('[live] railway detect complete', {
+                  requestId,
+                  payloadKb: (capture.payloadBytes / 1024).toFixed(1),
+                  capture: `${capture.captureWidth}x${capture.captureHeight}`,
+                  responseImage: `${response.image.width}x${response.image.height}`,
+                  people: response.people,
+                  inferenceMs: timing.serverInferenceMs.toFixed(0),
+                  roundTripMs: timing.requestTotalMs.toFixed(0),
+                  completed: debugStats.completed,
+                  dropped: debugStats.dropped,
+                  railwayStarted: railwayStartedRef.current,
+                  railwayCompleted: railwayCompletedRef.current,
+                  railwayFailed: railwayFailedRef.current,
+                  maxConcurrent: maxConcurrentRef.current,
+                })
+              }
+            } catch (error) {
+              if (!runningRef.current || sessionId !== sessionIdRef.current) {
+                return
+              }
+              if (
+                error instanceof RailwayDetectionError &&
+                error.message.includes('cancelled')
+              ) {
+                return
+              }
+              railwayFailedRef.current += 1
+              railwayCooldownUntilRef.current =
+                performance.now() + RAILWAY_ERROR_COOLDOWN_MS
+              publishDebugStats()
+              const message =
+                error instanceof Error
+                  ? error.message
+                  : 'Cloud live detection failed.'
+              setErrorMessage(message)
+              setDiagnostics((prev) => ({
+                ...prev,
+                railwayRequestsStarted: railwayStartedRef.current,
+                railwayRequestsCompleted: railwayCompletedRef.current,
+                railwayRequestsFailed: railwayFailedRef.current,
+              }))
+            } finally {
+              if (abortRef.current === abortController) {
+                abortRef.current = null
+              }
+              if (sessionId === sessionIdRef.current) {
+                setInFlight(false)
+                setIsDetecting(false)
+                setDiagnostics((prev) => ({ ...prev, activeRequests: 0 }))
+              } else {
+                inFlightRef.current = false
+                activeRequestsRef.current = 0
+              }
+            }
+          })()
+          return
+        }
+
+        // --- WebGPU path ---
+        const webGpuRuntime = getWebGpuInferenceOptions()
+        if (!webGpuRuntime) {
+          setErrorMessage(WEBGPU_REQUIRED_MESSAGE)
           return
         }
 
         if (inFlightRef.current || !tryBeginWebGpuInference()) {
-          droppedRef.current += 1
-          if (import.meta.env.DEV) {
-            const liveStats = (
-              window as Window & { __liveInferenceStats?: LiveInferenceDebugStats }
-            ).__liveInferenceStats
-            if (liveStats) liveStats.dropped = droppedRef.current
-          }
-          const now = performance.now()
-          if (now - lastDropUiRef.current >= 500) {
-            lastDropUiRef.current = now
-            const stats = publishDebugStats()
-            setDiagnostics((prev) => ({
-              ...prev,
-              droppedFrames: stats.dropped,
-              completedInferences: stats.completed,
-              effectiveInferenceFps: stats.effectiveFps,
-              maxConcurrentInference: stats.maxConcurrentInference,
-              activeRequests: inFlightRef.current ? 1 : 0,
-            }))
-          }
+          noteDroppedFrame()
           return
         }
 
@@ -506,7 +854,7 @@ export function useLiveDetection({
           let releaseSlot = true
           try {
             const result = await runIsolatedBrowserInference(video, {
-              ...runtime,
+              ...webGpuRuntime,
               modelImgsz: LIVE_WEBGPU_IMGSZ,
             })
 
@@ -581,6 +929,7 @@ export function useLiveDetection({
             }
 
             setDiagnostics({
+              runtime: 'webgpu',
               cameraWidth: sourceWidth,
               cameraHeight: sourceHeight,
               captureWidth: inferenceDiagnostics.letterbox.canvasWidth,
@@ -608,6 +957,10 @@ export function useLiveDetection({
               medianTotalMs: debugStats.medianTotalMs,
               effectiveInferenceFps: debugStats.effectiveFps,
               maxConcurrentInference: debugStats.maxConcurrentInference,
+              railwayRequestsStarted: 0,
+              railwayRequestsCompleted: 0,
+              railwayRequestsFailed: 0,
+              clientRoundTripMs: null,
             })
 
             if (recordingRef.current) {
@@ -652,7 +1005,7 @@ export function useLiveDetection({
       stopDetectionLoop()
       schedule()
     },
-    [publishDebugStats, setInFlight, stopDetectionLoop],
+    [noteDroppedFrame, publishDebugStats, setInFlight, stopDetectionLoop],
   )
 
   const startCamera = useCallback(
@@ -663,20 +1016,37 @@ export function useLiveDetection({
         return
       }
 
+      const force = isForceLiveRailwayFallback(forceRailwayRef.current)
       const webGpuStatus = getWebGpuRuntimeSnapshot().status
-      if (webGpuStatus !== 'ready') {
+      const cloudOk = isDetectionApiConfigured()
+
+      let runtime: LiveRuntimeMode | null = null
+      if (force) {
+        if (!cloudOk) {
+          setErrorMessage(
+            'Forced cloud fallback requires VITE_DETECTION_API_URL.',
+          )
+          return
+        }
+        runtime = 'railway'
+      } else if (webGpuStatus === 'ready' && getWebGpuInferenceOptions()) {
+        runtime = 'webgpu'
+      } else if (webGpuStatus === 'loading') {
+        setErrorMessage('WebGPU runtime is still loading.')
+        return
+      } else if (cloudOk) {
+        runtime = 'railway'
+      } else {
         stopCamera()
-        setErrorMessage(
-          webGpuStatus === 'loading'
-            ? 'WebGPU runtime is still loading.'
-            : WEBGPU_REQUIRED_MESSAGE,
-        )
+        setErrorMessage(LIVE_UNAVAILABLE_MESSAGE)
         return
       }
 
       stopCamera()
       setCameraState('requesting')
       setErrorMessage(null)
+      runtimeRef.current = runtime
+      setLiveRuntime(runtime)
 
       const constraints: MediaStreamConstraints = {
         audio: false,
@@ -717,8 +1087,18 @@ export function useLiveDetection({
         requestSeqRef.current = 0
         appliedSeqRef.current = 0
         completionTimestampsRef.current = []
+        completedRef.current = 0
+        droppedRef.current = 0
+        maxConcurrentRef.current = 0
+        railwayStartedRef.current = 0
+        railwayCompletedRef.current = 0
+        railwayFailedRef.current = 0
+        railwayCooldownUntilRef.current = 0
+        inferenceSamplesRef.current = []
+        totalSamplesRef.current = []
         runningRef.current = true
         pauseLoopRef.current = false
+        runtimeRef.current = runtime
 
         setCameraState('active')
         liveStartedAtRef.current = performance.now()
@@ -730,10 +1110,19 @@ export function useLiveDetection({
           detectionFps: null,
           cameraFps: null,
         })
+        setDiagnostics(
+          emptyDiagnostics(
+            confidenceRef.current,
+            captureWidthRef.current,
+            jpegQualityRef.current,
+            runtime,
+          ),
+        )
         startCameraFpsMonitor()
-        void runDetectionLoop(sessionId)
+        void runDetectionLoop(sessionId, runtime)
       } catch (error) {
         stopTracks()
+        runtimeRef.current = null
         const classified = classifyCameraError(error)
         setCameraState(classified.state)
         setErrorMessage(classified.message)
@@ -769,7 +1158,10 @@ export function useLiveDetection({
         peopleCount: result?.people ?? 0,
         captureWidth: captureWidthRef.current,
         jpegQuality: jpegQualityRef.current,
-        modelImgsz: LIVE_WEBGPU_IMGSZ,
+        modelImgsz:
+          runtimeRef.current === 'railway'
+            ? RAILWAY_MODEL_IMGSZ
+            : LIVE_WEBGPU_IMGSZ,
         scenario: scenarioRef.current,
       }
       setSessionMarkers((prev) => [...prev, marker])
@@ -786,13 +1178,18 @@ export function useLiveDetection({
   const exportSession = useCallback((): TestSessionExport | null => {
     const startedAt = sessionStartedAtRef.current
     if (!startedAt) return null
+    const runtime = runtimeRef.current
+    const note =
+      runtime === 'railway'
+        ? `Railway cloud CPU live detection at imgsz=${RAILWAY_MODEL_IMGSZ}. Sampled JPEG frames are uploaded.`
+        : `Browser WebGPU live detection at imgsz=${LIVE_WEBGPU_IMGSZ}. Frames are not uploaded.`
     return {
       startedAt,
       stoppedAt: new Date().toISOString(),
       scenario: scenarioRef.current,
       captureWidth: captureWidthRef.current,
       jpegQuality: jpegQualityRef.current,
-      modelImgszNote: `Browser WebGPU live detection at imgsz=${LIVE_WEBGPU_IMGSZ}. Frames are not uploaded.`,
+      modelImgszNote: note,
       records: sessionRecords,
       markers: sessionMarkers,
     }
@@ -807,6 +1204,7 @@ export function useLiveDetection({
   useEffect(() => {
     return () => {
       runningRef.current = false
+      sessionIdRef.current += 1
       stopDetectionLoop()
       abortRef.current?.abort()
       stopCameraFpsMonitor()
@@ -828,6 +1226,8 @@ export function useLiveDetection({
     lastRequestId,
     sessionRecords,
     sessionMarkers,
+    liveRuntime,
+    cloudFallbackConfigured,
     startCamera,
     stopCamera,
     switchCamera,

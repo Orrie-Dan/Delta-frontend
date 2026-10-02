@@ -1,5 +1,5 @@
 import type { LiveDiagnosticsSnapshot } from '../lib/liveTypes'
-import { PERFORMANCE_TARGETS } from '../lib/liveConfig'
+import { PERFORMANCE_TARGETS, RAILWAY_MODEL_IMGSZ } from '../lib/liveConfig'
 import { LIVE_WEBGPU_IMGSZ } from '../lib/onnxWebGpu'
 
 interface LiveDiagnosticsProps {
@@ -23,6 +23,9 @@ export function LiveDiagnostics({
   open,
   onToggle,
 }: LiveDiagnosticsProps) {
+  const isRailway = diagnostics.runtime === 'railway'
+  const isWebGpu = diagnostics.runtime === 'webgpu'
+
   return (
     <div className="live-diagnostics">
       <button
@@ -38,12 +41,35 @@ export function LiveDiagnostics({
       {open && (
         <div className="live-diagnostics__panel">
           <p className="live-diagnostics__note">
-            Live frames stay in the browser. WebGPU inference uses{' '}
-            <strong>imgsz={LIVE_WEBGPU_IMGSZ}</strong> with one inference at a
-            time. Extra camera frames are skipped.
+            {isRailway ? (
+              <>
+                Cloud CPU fallback uploads sampled JPEG frames to Railway{' '}
+                <code>/detect</code> at{' '}
+                <strong>imgsz={RAILWAY_MODEL_IMGSZ}</strong>. Max one HTTP
+                request in flight; busy frames are skipped.
+              </>
+            ) : isWebGpu ? (
+              <>
+                Live frames stay in the browser. WebGPU inference uses{' '}
+                <strong>imgsz={LIVE_WEBGPU_IMGSZ}</strong> with one inference at
+                a time. Extra camera frames are skipped.
+              </>
+            ) : (
+              <>No live inference runtime selected.</>
+            )}
           </p>
 
           <dl className="diag-grid">
+            <div>
+              <dt>Runtime</dt>
+              <dd>
+                {diagnostics.runtime === 'webgpu'
+                  ? 'webgpu'
+                  : diagnostics.runtime === 'railway'
+                    ? 'railway'
+                    : '—'}
+              </dd>
+            </div>
             <div>
               <dt>Camera</dt>
               <dd>
@@ -73,15 +99,31 @@ export function LiveDiagnostics({
               <dd>{fmt(diagnostics.encodeMs, 1, ' ms')}</dd>
             </div>
             <div>
-              <dt>Total (preprocess + inference + post)</dt>
-              <dd>{fmt(diagnostics.requestTotalMs, 0, ' ms')}</dd>
+              <dt>
+                {isRailway
+                  ? 'Client round-trip'
+                  : 'Total (preprocess + inference + post)'}
+              </dt>
+              <dd>
+                {fmt(
+                  isRailway
+                    ? diagnostics.clientRoundTripMs ?? diagnostics.requestTotalMs
+                    : diagnostics.requestTotalMs,
+                  0,
+                  ' ms',
+                )}
+              </dd>
             </div>
             <div>
-              <dt>Browser inference</dt>
+              <dt>{isRailway ? 'Server inference' : 'Browser inference'}</dt>
               <dd>{fmt(diagnostics.serverInferenceMs, 0, ' ms')}</dd>
             </div>
             <div>
-              <dt>Preprocess + postprocess</dt>
+              <dt>
+                {isRailway
+                  ? 'Non-inference overhead'
+                  : 'Preprocess + postprocess'}
+              </dt>
               <dd>{fmt(diagnostics.nonInferenceOverheadMs, 0, ' ms')}</dd>
             </div>
             <div>
@@ -105,7 +147,9 @@ export function LiveDiagnostics({
               <dd>{diagnostics.confidenceThreshold.toFixed(2)}</dd>
             </div>
             <div>
-              <dt>Inferences in flight</dt>
+              <dt>
+                {isRailway ? 'HTTP requests in flight' : 'Inferences in flight'}
+              </dt>
               <dd
                 className={
                   diagnostics.activeRequests > PERFORMANCE_TARGETS.maxInFlight
@@ -121,9 +165,25 @@ export function LiveDiagnostics({
               <dd>{fmtInt(diagnostics.completedInferences)}</dd>
             </div>
             <div>
-              <dt>Dropped frames</dt>
+              <dt>Frames skipped while busy</dt>
               <dd>{fmtInt(diagnostics.droppedFrames)}</dd>
             </div>
+            {isRailway && (
+              <>
+                <div>
+                  <dt>Railway requests started</dt>
+                  <dd>{fmtInt(diagnostics.railwayRequestsStarted)}</dd>
+                </div>
+                <div>
+                  <dt>Railway requests completed</dt>
+                  <dd>{fmtInt(diagnostics.railwayRequestsCompleted)}</dd>
+                </div>
+                <div>
+                  <dt>Railway requests failed</dt>
+                  <dd>{fmtInt(diagnostics.railwayRequestsFailed)}</dd>
+                </div>
+              </>
+            )}
             <div>
               <dt>Latest inference</dt>
               <dd>{fmt(diagnostics.latestInferenceMs, 0, ' ms')}</dd>
@@ -141,10 +201,11 @@ export function LiveDiagnostics({
               <dd>{fmt(diagnostics.effectiveInferenceFps, 2)}</dd>
             </div>
             <div>
-              <dt>Max concurrent inference</dt>
+              <dt>Max concurrent requests</dt>
               <dd
                 className={
-                  diagnostics.maxConcurrentInference > PERFORMANCE_TARGETS.maxInFlight
+                  diagnostics.maxConcurrentInference >
+                  PERFORMANCE_TARGETS.maxInFlight
                     ? 'diag-bad'
                     : 'diag-ok'
                 }
@@ -162,7 +223,10 @@ export function LiveDiagnostics({
             </div>
             <div>
               <dt>Model imgsz</dt>
-              <dd>{diagnostics.modelImgsz ?? LIVE_WEBGPU_IMGSZ}</dd>
+              <dd>
+                {diagnostics.modelImgsz ??
+                  (isRailway ? RAILWAY_MODEL_IMGSZ : LIVE_WEBGPU_IMGSZ)}
+              </dd>
             </div>
           </dl>
 
